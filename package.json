@@ -1,0 +1,15 @@
+{
+  "name": "ccpager",
+  "version": "0.6.0",
+  "description": "Local gateway for Claude Code: pages stale context out of each request, extends prompt-cache TTL, optional model routing.",
+  "type": "module",
+  "bin": { "ccpager": "bin/ccpager.js" },
+  "scripts": {
+    "start": "node bin/ccpager.js start",
+    "test": "node test/run.js",
+    "test:gui": "xvfb-run -a python3 test/gui_test.py",
+    "gui": "node bin/ccpager.js gui"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
