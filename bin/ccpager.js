@@ -11,6 +11,7 @@ import { installService, uninstallService, installedService, isRunning, health, 
 import { createLogger, logPath } from '../src/log.js';
 import { FEATURES, SETTINGS as TUNABLES, parseSetting, readState, writeState, effectiveConfig } from '../src/state.js';
 import { summarizeLimits, formatLimits, fmtClock, fmtDur } from '../src/limits.js';
+import { handleHook, installHook, hookInstalled } from '../src/hook.js';
 import { VERSION, checkForUpdate, readUpdateCache, parseRelease, installKind, downloadDeb, applyUpdate, RELEASES_URL } from '../src/update.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -89,7 +90,7 @@ function statsSummary(d) {
   return {
     since: d.since, today: period(sumDays(d.byDay, 1)), week: period(sumDays(d.byDay, 7)), all: period(d.totals || sumDays(d.byDay, 9999)),
     cacheHitRate: totalIn ? u.cacheRead / totalIn : 0, busiestHour: d.byHour.indexOf(Math.max(...d.byHour)),
-    pagedBlocks: d.pagedBlocks, routed: d.routed, protected: d.protected || 0, byModel: d.byModel || {}, requests: d.requests,
+    pagedBlocks: d.pagedBlocks, freshBlocks: d.freshBlocks || 0, freshChars: d.freshChars || 0, routed: d.routed, protected: d.protected || 0, byModel: d.byModel || {}, requests: d.requests,
     cacheWrite1h: u.cacheWrite1h || 0, cacheWrite5m: u.cacheWrite5m || 0,
   };
 }
@@ -113,7 +114,7 @@ ${row('  (if uncached)', (b) => `up to ${fmtUsd(b.savedHigh)}`)}
 ${row('API cost of the rest', (b) => fmtUsd(b.cost))}
 ${row('extra work in limit', (b) => (b.headroom == null ? '–' : `${b.headroom < 0 ? '−' : '+'}${Math.abs(100 * b.headroom).toFixed(1)}%`))}
 ${models.length ? `\n  by model\n${models.map(([m, b]) => `    ${m.padEnd(22)} ${String(b.requests).padStart(5)} req   ~${fmtTok(b.tokensSaved)} kept out   ${fmtUsd(b.savedLow)}–${fmtUsd(b.savedHigh)} saved`).join('\n')}\n` : ''}
-  cache hit rate      ${(100 * s.cacheHitRate).toFixed(1)}%      busiest hour ${s.busiestHour}:00      blocks paged ${s.pagedBlocks}${s.routed ? `      routed ${s.routed}` : ''}${ttlLine(s)}
+  cache hit rate      ${(100 * s.cacheHitRate).toFixed(1)}%      busiest hour ${s.busiestHour}:00      blocks paged ${s.pagedBlocks}${s.freshBlocks ? `      fresh results tidied ${s.freshBlocks} (~${Math.round(s.freshChars / 4 / 1000)}k tok)` : ''}${s.routed ? `      routed ${s.routed}` : ''}${ttlLine(s)}
 
   Money is API-equivalent value at list prices. On a Pro/Max plan you don't pay it, but
   it is the best guide to your usage limit: cache reads count almost nothing against the
@@ -144,6 +145,7 @@ async function statusObject() {
     ok: true,
     version: VERSION,
     install: installKind(),
+    hook: hookInstalled(),
     // The gateway reports the version it loaded; after an update it differs until restarted.
     restartNeeded: !!h && !!h.version && h.version !== VERSION,
     update: update && update.newer ? update : null,
@@ -153,7 +155,7 @@ async function statusObject() {
       global: { file: GLOBAL_SETTINGS, pointed: pointedAt(GLOBAL_SETTINGS) === mine },
       projects: projects().map((dir) => ({ dir, file: targetFile(dir), pointed: pointedAt(targetFile(dir)) === mine })),
     },
-    mode: { enabled: eff.enabled, paging: eff.paging, cache: eff.cacheTtl !== 'off', routing: eff.routing, protect: eff.protect, updates: eff.updateCheck },
+    mode: { enabled: eff.enabled, paging: eff.paging, fresh: eff.fresh, cache: eff.cacheTtl !== 'off', routing: eff.routing, protect: eff.protect, updates: eff.updateCheck },
     protect: h?.protect || { active: false, reason: null },
     settings: Object.fromEntries(Object.entries(TUNABLES).map(([n, s]) => [n, eff[s.key]])),
     settingsHelp: Object.fromEntries(Object.entries(TUNABLES).map(([n, s]) => [n, s.help])),
@@ -177,7 +179,7 @@ async function ensureRunning() {
 }
 
 const modeLine = (eff) => (eff.enabled
-  ? `ON  paging ${eff.paging ? 'on' : 'off'} · cache ${eff.cacheTtl === 'off' ? 'off' : eff.cacheTtl} · routing ${eff.routing ? 'on' : 'off'} · protect ${eff.protect ? 'on' : 'off'} · updates ${eff.updateCheck ? 'on' : 'off'}`
+  ? `ON  paging ${eff.paging ? 'on' : 'off'} · fresh ${eff.fresh ? 'on' : 'off'} · cache ${eff.cacheTtl === 'off' ? 'off' : eff.cacheTtl} · routing ${eff.routing ? 'on' : 'off'} · protect ${eff.protect ? 'on' : 'off'} · updates ${eff.updateCheck ? 'on' : 'off'}`
   : 'OFF: pass-through, requests forwarded unchanged');
 
 // ---------- commands ----------
@@ -263,6 +265,7 @@ claude    ${s.targets.global.pointed ? `✓ all Claude Code apps use ccpager (${
 mode      ${modeLine(eff)}
 settings  ${Object.entries(s.settings).map(([k, v]) => `${k}=${v}`).join(' ')}
 usage     ${usageLine(s.limits)}
+hook      ${s.hook ? 'installed: noisy Bash commands run in their quiet form' : 'not installed: run `ccpager hook install` to trim Bash output at the source'}
 version   ${s.version} (${s.install})${s.restartNeeded ? ` · gateway is running ${s.gateway.version}: run \`ccpager service restart\`` : ''}${s.update ? ` · ${s.update.latest} available: run \`ccpager update\`` : ''}
 protect   ${!s.mode.protect ? 'off' : s.protect.active ? `ACTIVE: ${s.protect.reason}; new sessions start on ${s.settings.protectModel}` : `armed (kicks in when a window would run out before its reset, or passes ${s.settings.protectAt}%)`}
 requests  ${s.stats?.requests ?? 0} so far
@@ -411,6 +414,23 @@ log       ${s.logFile}${fs.existsSync(s.logFile) ? '' : ' (not created yet)'}`);
     JSON_OUT ? console.log(JSON.stringify(lim)) : console.log(formatLimits(lim));
     break;
   }
+  case 'hook': {   // run: answer a Claude Code PreToolUse hook on stdin · install/--remove: edit ~/.claude/settings.json
+    const sub = rest[0];
+    if (sub === 'run') {
+      let input = ''; for await (const c of process.stdin) input += c;
+      const out = handleHook(input);
+      if (out) process.stdout.write(JSON.stringify(out));
+      break;
+    }
+    if (sub === 'install' || sub === 'remove' || rest.includes('--remove')) {
+      const remove = sub === 'remove' || rest.includes('--remove');
+      const bin = installKind() === 'deb' ? 'ccpager' : `"${process.execPath}" "${fileURLToPath(import.meta.url)}"`;
+      const r = installHook({ remove, command: `${bin} hook run` });
+      JSON_OUT ? console.log(JSON.stringify({ ok: true, ...r })) : console.log(remove ? `✓ Bash output hook removed from ${r.file}` : `✓ Bash output hook installed in ${r.file}. New Claude Code sessions run noisy commands (git, npm, pytest…) in their quiet form.`);
+      break;
+    }
+    fail('Usage: ccpager hook install|remove|run');
+  }
   case 'gui': {
     if (rest.includes('--uninstall')) {
       const base = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
@@ -466,7 +486,8 @@ StartupWMClass=io.github.ccpager
   ccpager disable [--project DIR]  send it straight to Anthropic again
   ccpager status           what's running, where it's routed, what's switched on   (--json)
   ccpager logs             recent requests, then follow live
-  ccpager off [feature]    switch optimizations off instantly (all, or paging | cache | routing | protect | updates)
+  ccpager off [feature]    switch optimizations off instantly (all, or paging | fresh | cache | routing | protect | updates)
+  ccpager hook install     trim noisy Bash output at the source (git, npm, pytest…) via a Claude Code hook  (--remove)
   ccpager on [feature]     switch back on
   ccpager set NAME VALUE   change a setting (saved; applies live). \`ccpager get\` lists them
   ccpager stats            tokens and money saved   (--json)

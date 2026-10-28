@@ -16,6 +16,11 @@ export const config = {
 
   // Context paging
   paging: bool(process.env.CCPAGER_PAGING, true),
+  // Fresh tool results: tidy noisy output (ANSI, progress bars, repeated lines, pretty JSON) and
+  // send a re-read of an unchanged or slightly changed file as a reference or diff. Decided on
+  // the newest message only, so the cache prefix is never disturbed.
+  fresh: bool(process.env.CCPAGER_FRESH, true),
+  rereadDiff: bool(process.env.CCPAGER_REREAD_DIFF, true),
   keepRecentTurns: num(process.env.CCPAGER_KEEP_TURNS, 6),   // recent steps (tool rounds) kept verbatim
   pageStep: num(process.env.CCPAGER_PAGE_STEP, 8),            // cutoff can move at most every N steps
   minPageChars: num(process.env.CCPAGER_MIN_CHARS, 1200),     // don't bother stubbing small outputs
