@@ -7,12 +7,13 @@ import { pageRequest, noteUsage } from '../src/pager.js';
 import { parseLimitHeaders, recordLimits, summarizeLimits, formatLimits } from '../src/limits.js';
 import { protectDecision, applyProtect } from '../src/protect.js';
 import { transform } from '../src/server.js';
+import { compareVersions, parseRelease, installKind, checkForUpdate, VERSION } from '../src/update.js';
 import { extendCacheTtl, routeModel } from '../src/transforms.js';
 import { createServer } from '../src/server.js';
 import { createLogger } from '../src/log.js';
 import { writeState } from '../src/state.js';
 import { costOf, priceFor } from '../src/pricing.js';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 
 let pass = 0;
 const test = async (name, fn) => { await fn(); pass++; console.log('  ✓', name); };
@@ -381,7 +382,54 @@ await test('end to end: a session running out before its reset makes the next ne
   assert.equal(gw.stats.data.protected, 1);
   const health = await (await fetch(`http://127.0.0.1:${gw.address().port}/ccpager/health`)).json();
   assert.equal(health.protect.active, true);
+  assert.equal(health.version, VERSION);
   gw.close(); upstream.close();
+});
+
+console.log('updates');
+await test('version comparison and release parsing', () => {
+  assert.equal(compareVersions('0.6.0', '0.5.9'), 1); assert.equal(compareVersions('v0.6.0', '0.6.0'), 0);
+  assert.equal(compareVersions('0.6.0', '0.10.0'), -1); assert.equal(compareVersions('1.0.0-rc1', '1.0.0'), -1);
+  const rel = { tag_name: 'v9.9.9', html_url: 'https://x/rel', body: '## Notes\n- thing', assets: [{ name: 'ccpager_9.9.9_all.deb', browser_download_url: 'https://x/d.deb', size: 5 }, { name: 'SHA256SUMS', browser_download_url: 'https://x/s' }] };
+  const p = parseRelease(rel, '0.6.0');
+  assert.equal(p.newer, true); assert.equal(p.latest, '9.9.9'); assert.equal(p.deb.name, 'ccpager_9.9.9_all.deb'); assert.equal(p.sums, 'https://x/s');
+  assert.equal(parseRelease({ tag_name: 'v0.1.0' }, '0.6.0').newer, false);
+  assert.equal(parseRelease({}), null);
+  assert.equal(installKind(os.tmpdir()), 'manual');
+  assert.match(VERSION, /^\d+\.\d+\.\d+$/);
+});
+await test('checkForUpdate caches for a day, forces on demand, and degrades to the cache offline', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccpager-'));
+  let calls = 0;
+  const fetchImpl = async () => { calls++; return { ok: true, json: async () => ({ tag_name: 'v99.0.0', html_url: 'u', assets: [] }) }; };
+  const a = await checkForUpdate({ dataDir, fetchImpl, now: 1000 });
+  assert.equal(a.newer, true); assert.equal(a.cached, false); assert.equal(calls, 1);
+  const b = await checkForUpdate({ dataDir, fetchImpl, now: 2000 });
+  assert.equal(b.cached, true); assert.equal(calls, 1);
+  await checkForUpdate({ dataDir, fetchImpl, now: 2000, force: true }); assert.equal(calls, 2);
+  const c = await checkForUpdate({ dataDir, fetchImpl, now: 1000 + 25 * 3600e3 }); assert.equal(c.cached, false); assert.equal(calls, 3);
+  const down = await checkForUpdate({ dataDir, fetchImpl: async () => { throw new Error('offline'); }, force: true });
+  assert.equal(down.error, 'offline'); assert.equal(down.latest, '99.0.0'); assert.equal(down.cached, true);
+  const fresh = await checkForUpdate({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'ccpager-')), fetchImpl: async () => { throw new Error('offline'); } });
+  assert.equal(fresh.latest, null); assert.equal(fresh.newer, false); assert.equal(fresh.error, 'offline');
+});
+await test('CLI: version, update --check against a mock release endpoint, status shows the update', async () => {
+  const srv = http.createServer((req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ tag_name: 'v99.0.0', html_url: 'https://example/rel', body: 'big news', assets: [] })); }).listen(0);
+  await new Promise((r) => srv.once('listening', r));
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccpager-'));
+  const env = { ...process.env, CCPAGER_HOME: dataDir, CCPAGER_PORT: '18999', HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'home-')), CCPAGER_UPDATE_URL: `http://127.0.0.1:${srv.address().port}/latest` };
+  // The mock server lives in this process, so the CLI must run asynchronously or it never gets served.
+  const cli = (...a) => new Promise((resolve, reject) => execFile(process.execPath, ['bin/ccpager.js', ...a], { env, encoding: 'utf8' }, (e, out, err) => e ? reject(new Error(err || e.message)) : resolve(out)));
+  assert.match(await cli('version'), /^ccpager \d+\.\d+\.\d+ \((git|deb|manual) install\)/);
+  assert.match(await cli('update', '--check'), /Version 99\.0\.0 is available/);
+  const j = JSON.parse((await cli('update', '--check', '--json')).trim().split('\n').pop());
+  assert.equal(j.newer, true); assert.equal(j.cached, true);
+  assert.match(await cli('status'), /version   \d+\.\d+\.\d+ \(\w+\) · 99\.0\.0 available: run `ccpager update`/);
+  const st = JSON.parse((await cli('status', '--json')).trim().split('\n').pop());
+  assert.equal(st.update.latest, '99.0.0'); assert.equal(st.restartNeeded, false);
+  assert.match(await cli('off', 'updates'), /updates off/);
+  assert.equal(JSON.parse((await cli('status', '--json')).trim().split('\n').pop()).update, null, 'notice hidden when checks are off');
+  srv.close();
 });
 
 console.log('pricing & savings');
@@ -407,11 +455,11 @@ await test('on/off/status/stats commands', () => {
   const env = { ...process.env, HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'home-')), CCPAGER_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'ccp-')), CCPAGER_PORT: '18765' };
   const cli = (...a) => execFileSync(process.execPath, ['bin/ccpager.js', ...a], { env, encoding: 'utf8' });
   assert.match(cli('off'), /OFF: requests now pass through unchanged/);
-  assert.match(cli('on', 'routing'), /ON  paging on · cache off · routing on · protect on/); // 1h upgrade is off by default
+  assert.match(cli('on', 'routing'), /ON  paging on · cache off · routing on · protect on · updates on/); // 1h upgrade is off by default
   assert.match(cli('on', 'cache'), /cache 1h/);
   assert.match(cli('off', 'cache'), /cache off/);
   assert.throws(() => execFileSync(process.execPath, ['bin/ccpager.js', 'off', 'bogus'], { env, encoding: 'utf8', stdio: 'pipe' }));
-  assert.match(cli('status'), /mode      ON  paging on · cache off · routing on · protect on/);
+  assert.match(cli('status'), /mode      ON  paging on · cache off · routing on · protect on · updates on/);
   assert.match(cli('status'), /protect   armed/);
   assert.match(cli('off', 'protect'), /protect off/);
   assert.match(cli('status'), /usage     not seen yet/);

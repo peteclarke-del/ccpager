@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ccpager
+GenericName=Claude Code context gateway
+Comment=Turn context paging on or off, set up Claude Code, view usage, logs and savings
+Exec=/usr/bin/python3 /usr/lib/ccpager/gui/ccpager_gui.py --node /usr/bin/node
+Icon=ccpager
+Terminal=false
+Categories=Development;Utility;
+Keywords=claude;claude code;tokens;context;vscode;
+StartupNotify=true
+StartupWMClass=io.github.ccpager

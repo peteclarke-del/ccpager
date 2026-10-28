@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const FEATURES = { paging: 'paging', cache: 'cacheTtl', routing: 'routing', protect: 'protect' };
+export const FEATURES = { paging: 'paging', cache: 'cacheTtl', routing: 'routing', protect: 'protect', updates: 'updateCheck' };
 
 export const statePath = (dataDir) => path.join(dataDir, 'state.json');
 
@@ -60,6 +60,7 @@ export function effectiveConfig(config, state) {
   if (typeof state.paging === 'boolean') c.paging = state.paging;
   if (typeof state.routing === 'boolean') c.routing = state.routing;
   if (typeof state.protect === 'boolean') c.protect = state.protect;
+  if (typeof state.updates === 'boolean') c.updateCheck = state.updates;
   for (const [name, s] of Object.entries(SETTINGS)) {
     if (name === 'port' || state[name] === undefined) continue;
     // Before 0.4 these counted typed prompts, not steps; old saved values would page far too aggressively.

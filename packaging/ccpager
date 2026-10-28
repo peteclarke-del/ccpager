@@ -1,0 +1,3 @@
+#!/bin/sh
+# Launcher installed by the Debian package.
+exec node /usr/lib/ccpager/bin/ccpager.js "$@"
