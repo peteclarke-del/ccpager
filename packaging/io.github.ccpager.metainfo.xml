@@ -14,6 +14,9 @@
   <developer id="io.github.peteclarke-del"><name>Pete Clarke</name></developer>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.7.0" date="2026-10-28">
+      <description><p>Cache-safe tidying of fresh tool output with re-reads sent as diffs, and an optional Claude Code hook that runs noisy Bash commands in their quiet form.</p></description>
+    </release>
     <release version="0.6.0" date="2026-10-28">
       <description><p>Cache-aware paging, plan usage gauges with run-out prediction, adaptive protection of the usage limit, in-app updates, and a Debian package.</p></description>
     </release>
