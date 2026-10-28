@@ -11,6 +11,7 @@ import { installService, uninstallService, installedService, isRunning, health, 
 import { createLogger, logPath } from '../src/log.js';
 import { FEATURES, SETTINGS as TUNABLES, parseSetting, readState, writeState, effectiveConfig } from '../src/state.js';
 import { summarizeLimits, formatLimits, fmtClock, fmtDur } from '../src/limits.js';
+import { VERSION, checkForUpdate, readUpdateCache, parseRelease, installKind, downloadDeb, applyUpdate, RELEASES_URL } from '../src/update.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const GLOBAL_SETTINGS = path.join(os.homedir(), '.claude', 'settings.json');
@@ -137,15 +138,22 @@ async function statusObject() {
   const st = readState(config.dataDir);
   const eff = effectiveConfig(config, st);
   const mine = url();
+  const cachedRel = readUpdateCache(config.dataDir)?.release;
+  const update = eff.updateCheck && cachedRel ? { ...parseRelease(cachedRel), kind: installKind() } : null;
   return {
     ok: true,
-    gateway: { running: !!h, legacy: !!h?.legacy, pid: h?.pid ?? null, startedAt: h?.startedAt ?? null, url: mine, port: config.port },
+    version: VERSION,
+    install: installKind(),
+    // The gateway reports the version it loaded; after an update it differs until restarted.
+    restartNeeded: !!h && !!h.version && h.version !== VERSION,
+    update: update && update.newer ? update : null,
+    gateway: { running: !!h, version: h?.version ?? null, legacy: !!h?.legacy, pid: h?.pid ?? null, startedAt: h?.startedAt ?? null, url: mine, port: config.port },
     service: installedService(),
     targets: {
       global: { file: GLOBAL_SETTINGS, pointed: pointedAt(GLOBAL_SETTINGS) === mine },
       projects: projects().map((dir) => ({ dir, file: targetFile(dir), pointed: pointedAt(targetFile(dir)) === mine })),
     },
-    mode: { enabled: eff.enabled, paging: eff.paging, cache: eff.cacheTtl !== 'off', routing: eff.routing, protect: eff.protect },
+    mode: { enabled: eff.enabled, paging: eff.paging, cache: eff.cacheTtl !== 'off', routing: eff.routing, protect: eff.protect, updates: eff.updateCheck },
     protect: h?.protect || { active: false, reason: null },
     settings: Object.fromEntries(Object.entries(TUNABLES).map(([n, s]) => [n, eff[s.key]])),
     settingsHelp: Object.fromEntries(Object.entries(TUNABLES).map(([n, s]) => [n, s.help])),
@@ -169,7 +177,7 @@ async function ensureRunning() {
 }
 
 const modeLine = (eff) => (eff.enabled
-  ? `ON  paging ${eff.paging ? 'on' : 'off'} · cache ${eff.cacheTtl === 'off' ? 'off' : eff.cacheTtl} · routing ${eff.routing ? 'on' : 'off'} · protect ${eff.protect ? 'on' : 'off'}`
+  ? `ON  paging ${eff.paging ? 'on' : 'off'} · cache ${eff.cacheTtl === 'off' ? 'off' : eff.cacheTtl} · routing ${eff.routing ? 'on' : 'off'} · protect ${eff.protect ? 'on' : 'off'} · updates ${eff.updateCheck ? 'on' : 'off'}`
   : 'OFF: pass-through, requests forwarded unchanged');
 
 // ---------- commands ----------
@@ -255,6 +263,7 @@ claude    ${s.targets.global.pointed ? `✓ all Claude Code apps use ccpager (${
 mode      ${modeLine(eff)}
 settings  ${Object.entries(s.settings).map(([k, v]) => `${k}=${v}`).join(' ')}
 usage     ${usageLine(s.limits)}
+version   ${s.version} (${s.install})${s.restartNeeded ? ` · gateway is running ${s.gateway.version}: run \`ccpager service restart\`` : ''}${s.update ? ` · ${s.update.latest} available: run \`ccpager update\`` : ''}
 protect   ${!s.mode.protect ? 'off' : s.protect.active ? `ACTIVE: ${s.protect.reason}; new sessions start on ${s.settings.protectModel}` : `armed (kicks in when a window would run out before its reset, or passes ${s.settings.protectAt}%)`}
 requests  ${s.stats?.requests ?? 0} so far
 log       ${s.logFile}${fs.existsSync(s.logFile) ? '' : ' (not created yet)'}`);
@@ -363,6 +372,40 @@ log       ${s.logFile}${fs.existsSync(s.logFile) ? '' : ' (not created yet)'}`);
     JSON_OUT ? console.log(JSON.stringify(statsSummary(d))) : printStats(d);
     break;
   }
+  case 'version': console.log(JSON_OUT ? JSON.stringify({ version: VERSION, install: installKind() }) : `ccpager ${VERSION} (${installKind()} install)`); break;
+  case 'update': {  // --check only looks; otherwise download/pull, install, and restart the gateway
+    const st = readState(config.dataDir);
+    const force = rest.includes('--force') || !rest.includes('--check');
+    const check = await checkForUpdate({ dataDir: config.dataDir, force });
+    if (rest.includes('--check')) {
+      if (JSON_OUT) console.log(JSON.stringify(check));
+      else if (check.error && !check.latest) console.log(`✗ Couldn't check for updates: ${check.error}`);
+      else console.log(check.newer ? `Version ${check.latest} is available (you have ${check.current}). Run \`ccpager update\`.\n${check.url}` : `ccpager ${check.current} is the latest version.${check.error ? ` (check failed: ${check.error}; showing the last answer)` : ''}`);
+      break;
+    }
+    if (check.error && !check.latest) fail(`Couldn't check for updates: ${check.error}`);
+    if (!check.newer) { JSON_OUT ? console.log(JSON.stringify({ ok: true, updated: false, version: VERSION })) : console.log(`ccpager ${VERSION} is already the latest version.`); break; }
+    const kind = installKind();
+    if (kind === 'manual') fail(`ccpager ${check.latest} is available, but this copy was unpacked by hand so it can't update itself.\n  Download it from ${check.url}`);
+    let file = null;
+    if (kind === 'deb') {
+      if (!check.deb) fail(`Release ${check.latest} has no Debian package yet: ${check.url}`);
+      if (!JSON_OUT) console.log(`Downloading ${check.deb.name}…`);
+      file = await downloadDeb(check, path.join(config.dataDir, 'updates'));
+    }
+    if (!JSON_OUT) console.log(kind === 'git' ? 'Pulling the latest code…' : 'Installing (your desktop will ask for your password)…');
+    const did = applyUpdate({ kind, file, interactive: !JSON_OUT });
+    let restarted = false;
+    if (installedService() && await isRunning(config.port)) {
+      execFileSync(process.execPath, [fileURLToPath(import.meta.url), 'service', 'restart'], { stdio: JSON_OUT ? 'pipe' : 'inherit' });
+      restarted = true;
+    }
+    const now = execFileSync(process.execPath, [fileURLToPath(import.meta.url), 'version', '--json'], { encoding: 'utf8' });
+    const to = JSON.parse(now.trim().split('\n').pop()).version;
+    JSON_OUT ? console.log(JSON.stringify({ ok: true, updated: true, from: VERSION, to, did, restarted }))
+      : console.log(`✓ ${did}: ccpager ${VERSION} → ${to}${restarted ? ', gateway restarted' : ''}. Reopen the settings window to use the new version.`);
+    break;
+  }
   case 'usage': {   // plan limits: session window, weekly cap, pace and predicted run-out
     const lim = summarizeLimits(Stats.read(config.dataDir)?.limits);
     JSON_OUT ? console.log(JSON.stringify(lim)) : console.log(formatLimits(lim));
@@ -423,11 +466,13 @@ StartupWMClass=io.github.ccpager
   ccpager disable [--project DIR]  send it straight to Anthropic again
   ccpager status           what's running, where it's routed, what's switched on   (--json)
   ccpager logs             recent requests, then follow live
-  ccpager off [feature]    switch optimizations off instantly (all, or paging | cache | routing | protect)
+  ccpager off [feature]    switch optimizations off instantly (all, or paging | cache | routing | protect | updates)
   ccpager on [feature]     switch back on
   ccpager set NAME VALUE   change a setting (saved; applies live). \`ccpager get\` lists them
   ccpager stats            tokens and money saved   (--json)
   ccpager usage            plan usage: 5-hour session, weekly cap, pace and predicted run-out   (--json)
+  ccpager update           update to the latest release and restart the gateway  (--check only looks)
+  ccpager version          installed version and how it was installed
   ccpager service install|restart|remove   background service only
   ccpager claude [args]    start the gateway and launch the claude CLI through it
   ccpager start | stop     run in the foreground / stop a background gateway

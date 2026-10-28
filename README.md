@@ -15,6 +15,16 @@ A local, open-source take on what Vachi AI does: a gateway that sits between Cla
 
 ## Quick start on a Linux desktop
 
+**Debian / Ubuntu package** (recommended): download `ccpager_<version>_all.deb` from the [latest release](https://github.com/peteclarke-del/ccpager/releases/latest) and install it:
+
+```bash
+sudo apt install ./ccpager_0.6.0_all.deb
+```
+
+That installs the `ccpager` command, adds **ccpager** to your app menu and pulls in Node.js and the GTK libraries. It works on any architecture.
+
+**From a clone** (any distribution):
+
 ```bash
 git clone https://github.com/peteclarke-del/ccpager.git && cd ccpager
 ./install.sh
@@ -36,6 +46,16 @@ The window needs GTK 4 + libadwaita for Python, already present on most GNOME de
 - **Logs**: one line per request, following live.
 
 The window runs the same `ccpager` commands you can type, so the window and the terminal always agree. Everything is saved in `~/.ccpager/state.json`.
+
+### Updates
+
+ccpager checks GitHub's releases page for a newer version at most once a day (one small request; nothing else is sent). When one exists, the Overview shows an **Update available** row with **Update & restart**, and `ccpager status` says so. The update depends on how ccpager was installed:
+
+- **package**: downloads the new `.deb`, verifies it against the release's `SHA256SUMS`, installs it (your desktop asks for your password), restarts the gateway and reopens the window;
+- **clone**: `git pull --ff-only`, then the same restart;
+- **unpacked by hand**: the release page is opened instead.
+
+Running replies are never cut off: the restart waits for them (see "Honest caveats"). From a terminal, `ccpager update --check` only looks and `ccpager update` does the whole thing. Turn the daily check off in Settings or with `ccpager off updates`. If the gateway is running an older version than the files on disk (after any update), the Overview's Gateway row says so and its Restart button is highlighted.
 
 ## Install and run
 
@@ -101,7 +121,7 @@ No restart, no VS Code reload. The change applies to the next request:
 ```bash
 ccpager off            # pure pass-through: requests forwarded byte-for-byte unchanged
 ccpager on             # back on
-ccpager off routing    # or toggle one feature: paging | cache | routing | protect
+ccpager off routing    # or toggle one feature: paging | cache | routing | protect | updates
 ccpager on routing
 ```
 
@@ -217,6 +237,7 @@ ccpager enable --project ~/code/billing-api    # just one project
 | `CCPAGER_PROTECT` | `true` | adaptive protection of the usage limit (see above) |
 | `CCPAGER_PROTECT_MODEL` | `claude-sonnet-5-5` | model new sessions start on while protection is active |
 | `CCPAGER_PROTECT_AT` | 80 | percent of a window at which protection kicks in regardless of pace |
+| `CCPAGER_UPDATE_CHECK` | `true` | look for a newer release once a day |
 | `CCPAGER_ROUTING` | false | turn-level routing |
 | `CCPAGER_SMALL_MODEL` | `claude-haiku-5-5` | routing target |
 | `CCPAGER_PAGING` | true | master switch for paging |
@@ -233,6 +254,10 @@ ccpager enable --project ~/code/billing-api    # just one project
 - The biggest limit savings are on the Claude Code side, not in any proxy: set `CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-5-5` in `~/.claude/settings.json` `env` so Explore and helper agents never run on Opus, keep tool output and replies terse (output tokens cost 5× input), and avoid spawning short-lived subagents for things a grep answers, since every fresh session rewrites the cache.
 - Restarting the gateway (port change, update) stops accepting new connections at once but lets replies already streaming finish, for up to 30 seconds. Claude Code retries the connection in the meantime.
 - If the upstream connection drops before any response (a reset keep-alive socket), the request is sent once more rather than failing the turn; the request body was buffered so nothing is lost.
+
+## Releases
+
+A release is a tag `vX.Y.Z` whose version matches `package.json` and the newest `<release>` in `packaging/io.github.ccpager.metainfo.xml` (`packaging/check-release-tag.sh` refuses anything else). Pushing the tag runs `.github/workflows/release.yml`, which tests, builds the `.deb` with `packaging/build-deb.sh`, installs it on a clean Ubuntu runner to verify it, and publishes a GitHub release with the package, a source archive and `SHA256SUMS`. `ccpager update` on installed copies then offers it.
 
 ## Tests
 

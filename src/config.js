@@ -42,6 +42,10 @@ export const config = {
   protectModel: process.env.CCPAGER_PROTECT_MODEL || 'claude-sonnet-5-5',
   protectAt: num(process.env.CCPAGER_PROTECT_AT, 80),
 
+  // Look for a newer release on GitHub at most once a day and say so in `ccpager status` and
+  // the window. One small GET; nothing else is sent. `ccpager off updates` disables it.
+  updateCheck: bool(process.env.CCPAGER_UPDATE_CHECK, true),
+
   dataDir,
   verbose: bool(process.env.CCPAGER_VERBOSE, false),
 };
