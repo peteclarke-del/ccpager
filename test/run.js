@@ -7,6 +7,8 @@ import { pageRequest, noteUsage } from '../src/pager.js';
 import { parseLimitHeaders, recordLimits, summarizeLimits, formatLimits } from '../src/limits.js';
 import { protectDecision, applyProtect } from '../src/protect.js';
 import { transform } from '../src/server.js';
+import { tidy, lineDiff, compressFresh, pinnedBases } from '../src/fresh.js';
+import { rewriteCommand, handleHook, installHook, hookInstalled } from '../src/hook.js';
 import { compareVersions, parseRelease, installKind, checkForUpdate, VERSION } from '../src/update.js';
 import { extendCacheTtl, routeModel } from '../src/transforms.js';
 import { createServer } from '../src/server.js';
@@ -386,6 +388,133 @@ await test('end to end: a session running out before its reset makes the next ne
   gw.close(); upstream.close();
 });
 
+console.log('fresh tool results (cache-safe)');
+await test('tidy strips ANSI, progress bars, trailing space, blank runs, repeated lines, pretty JSON', () => {
+  const noisy = '\x1b[32mok\x1b[0m   \n\n\n\nprogress 10%\rprogress 50%\rprogress 100%\nsame\nsame\nsame\nsame\nend\n\n';
+  assert.equal(tidy(noisy), 'ok\n\nprogress 100%\nsame   [× 4]\nend');
+  const pretty = JSON.stringify({ a: Array.from({ length: 200 }, (_, i) => ({ i, name: 'x' + i })) }, null, 4);
+  assert.ok(tidy(pretty).length < pretty.length * 0.8);
+  assert.equal(tidy('plain\ntext'), 'plain\ntext');
+});
+await test('lineDiff produces compact hunks and null when too big', () => {
+  const a = Array.from({ length: 100 }, (_, i) => 'line ' + i).join('\n');
+  const b = a.replace('line 50', 'line fifty').replace('line 90\n', 'line 90\nnew line\n');
+  const d = lineDiff(a, b);
+  assert.match(d, /@@ -49,5 \+49,5 @@/); assert.match(d, /-line 50\n\+line fifty/); assert.match(d, /\+new line/);
+  assert.ok(d.length < b.length / 4);
+  assert.equal(lineDiff(a, a), '');
+  assert.equal(lineDiff('x\n'.repeat(7000), 'y'), null);
+});
+const freshBody = (results) => { // results: [{target, text, err?}] in order, each a Read step
+  const messages = [{ role: 'user', content: [{ type: 'text', text: 'go' }] }];
+  results.forEach((r, i) => {
+    messages.push({ role: 'assistant', content: [{ type: 'tool_use', id: 'u' + i, name: 'Read', input: { file_path: r.target } }] });
+    messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'u' + i, content: r.text, is_error: !!r.err }] });
+  });
+  return messages;
+};
+await test('fresh: decides only on the newest result, then replays byte-identically; errors untouched', () => {
+  const s = { stubbed: new Map(), fresh: new Map(), boundary: 0, lastAt: null };
+  const noisy = '\x1b[31m' + 'x'.repeat(300) + '\x1b[0m\n\n\n\n' + 'dup\n'.repeat(80);
+  const m1 = freshBody([{ target: 'a.log', text: noisy }]);
+  const r1 = compressFresh(m1, s);
+  assert.equal(r1.freshBlocks, 1); assert.ok(r1.charsSaved > 150); assert.equal(s.fresh.size, 1);
+  const first = r1.out[2].content[0].content;
+  const m2 = freshBody([{ target: 'a.log', text: noisy }, { target: 'b.txt', text: 'clean text '.repeat(60) }]);
+  const r2 = compressFresh(m2, s);
+  assert.equal(r2.out[2].content[0].content, first, 'older decision replays unchanged');
+  assert.equal(r2.out[4].content[0].content, 'clean text '.repeat(60), 'nothing to tidy: untouched');
+  assert.equal(s.fresh.size, 1);
+  const m3 = freshBody([{ target: 'a.log', text: noisy }, { target: 'e.log', text: noisy, err: true }]);
+  assert.equal(compressFresh(m3, s).freshBlocks, 1, 'error results are never rewritten');
+  assert.equal(compressFresh(m1, s, { enabled: false }).freshBlocks, 0);
+});
+await test('fresh: a re-read becomes a reference when identical, a diff when slightly changed, the file when very different', () => {
+  const s = { stubbed: new Map(), fresh: new Map(), boundary: 0, lastAt: null };
+  const file = Array.from({ length: 120 }, (_, i) => `const v${i} = ${i};`).join('\n');
+  const same = freshBody([{ target: 'src/a.js', text: file }, { target: 'src/a.js', text: file }]);
+  const r = compressFresh(same, s);
+  assert.match(r.out[4].content[0].content, /^\[ccpager: Read src\/a\.js is identical to the result at message 3/);
+  assert.equal(s.fresh.get('u1').base, 'u0');
+  assert.deepEqual([...pinnedBases(same, s)], ['u0'], 'the base is pinned against paging');
+  const edited = file.replace('const v60 = 60;', 'const v60 = 61; // bumped');
+  const s2 = { stubbed: new Map(), fresh: new Map(), boundary: 0, lastAt: null };
+  const d = compressFresh(freshBody([{ target: 'src/a.js', text: file }, { target: 'src/a.js', text: edited }]), s2);
+  const body = d.out[4].content[0].content;
+  assert.match(body, /changed since message 3; unified diff/); assert.match(body, /-const v60 = 60;\n\+const v60 = 61; \/\/ bumped/);
+  assert.ok(body.length < edited.length / 3);
+  const s3 = { stubbed: new Map(), fresh: new Map(), boundary: 0, lastAt: null };
+  const other = Array.from({ length: 120 }, (_, i) => `let w${i} = "${i}";`).join('\n');
+  const f = compressFresh(freshBody([{ target: 'src/a.js', text: file }, { target: 'src/a.js', text: other }]), s3);
+  assert.equal(f.out[4].content[0].content, other, 'a rewrite that would be bigger than the file is not used');
+  const off = compressFresh(freshBody([{ target: 'src/a.js', text: file }, { target: 'src/a.js', text: file }]), { fresh: new Map() }, { rereadDiff: false });
+  assert.equal(off.freshBlocks, 0);
+});
+await test('fresh + paging, step by step like the gateway: a diff pins its base against later paging', () => {
+  const s = newSession(); s.fresh = new Map();
+  const file = Array.from({ length: 200 }, (_, i) => `line ${i} ${'x'.repeat(20)}`).join('\n');
+  const steps = Array.from({ length: 34 }, (_, i) => ({ target: 'f' + i, text: 'y'.repeat(3000) }));
+  steps[20] = { target: 'src/a.js', text: file };
+  steps[25] = { target: 'src/a.js', text: file + '\nextra' };
+  const opts = { ...smart, keepRecentTurns: 4, pageStep: 8, cacheTtl: 'off' }; // 5m price ratio: moves at steps 12, 20, 28
+  let sawDiffPastBase = false;
+  for (let n = 1; n <= steps.length; n++) {
+    const msgs = freshBody(steps.slice(0, n));
+    const r = pageRequest({ model: 'claude-opus-5-5', messages: msgs }, { ...opts, pinned: pinnedBases(msgs, s) }, s, n * 1000);
+    const f = compressFresh(r.body.messages, s);
+    if (n === 26) assert.equal(s.fresh.get('u25')?.base, 'u20', 'the re-read was decided as a diff while its base was still in full');
+    if (n >= 26 && !s.stubbed.has('u25')) { // while the diff is live, its base must be too, whatever paging did around it
+      assert.ok(!s.stubbed.has('u20'), `pinned base survives paging at step ${n}`);
+      assert.match(f.out[2 + 2 * 25].content[0].content, /changed since message \d+; unified diff/);
+      assert.equal(f.out[2 + 2 * 20].content[0].content, file, 'the base is still sent in full');
+      if (s.boundary > 20) { sawDiffPastBase = true; assert.ok(s.stubbed.has('u19'), 'its neighbours were paged as usual'); }
+    }
+  }
+  assert.ok(sawDiffPastBase, 'the cutoff moved past the base while the diff was live');
+});
+
+console.log('bash output hook');
+await test('rewrites noisy commands to quiet equivalents, leaves pipelines and unknown commands alone', () => {
+  assert.equal(rewriteCommand('git status'), 'git status --short --branch');
+  assert.equal(rewriteCommand('git log'), 'git --no-pager log --oneline -n 30');
+  assert.equal(rewriteCommand('git log --oneline -5'), 'git --no-pager log --oneline -5');
+  assert.equal(rewriteCommand('git push origin main'), 'git push --quiet origin main');
+  assert.equal(rewriteCommand('git push -q origin main'), null);
+  assert.match(rewriteCommand('npm install'), /--no-fund --no-audit --loglevel=error/);
+  assert.match(rewriteCommand('npm test'), /npm test --silent 2>&1 \| tail -n 60/);
+  assert.match(rewriteCommand('pytest tests/x.py'), /pytest -q --no-header/);
+  assert.equal(rewriteCommand('pytest -q'), null);
+  assert.equal(rewriteCommand('cargo build --release'), 'cargo build -q --release');
+  assert.equal(rewriteCommand('curl https://x'), 'curl -sS https://x');
+  assert.equal(rewriteCommand('ls -la'), 'ls -la | head -n 100');
+  assert.equal(rewriteCommand('git status | head'), null, 'pipelines are the user\'s own');
+  assert.equal(rewriteCommand('rm -rf build && make'), null);
+  assert.equal(rewriteCommand('echo $HOME'), null);
+  assert.equal(rewriteCommand('node bin/ccpager.js status'), null);
+  assert.equal(rewriteCommand(''), null); assert.equal(rewriteCommand(42), null);
+});
+await test('handleHook answers Bash only, with updatedInput and no permission decision', () => {
+  const out = handleHook(JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'git status', description: 'x' } }));
+  assert.equal(out.hookSpecificOutput.hookEventName, 'PreToolUse');
+  assert.deepEqual(out.hookSpecificOutput.updatedInput, { command: 'git status --short --branch', description: 'x' });
+  assert.equal('permissionDecision' in out.hookSpecificOutput, false, 'never bypasses the permission prompt');
+  assert.equal(handleHook({ tool_name: 'Read', tool_input: { file_path: 'x' } }), null);
+  assert.equal(handleHook({ tool_name: 'Bash', tool_input: { command: 'cat x' } }), null);
+  assert.equal(handleHook('not json'), null);
+});
+await test('installHook adds one PreToolUse entry, is idempotent, keeps other hooks, and removes cleanly', () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ccpager-')), 'settings.json');
+  fs.writeFileSync(file, JSON.stringify({ env: { A: '1' }, hooks: { PreToolUse: [{ matcher: 'Write', hooks: [{ type: 'command', command: 'other' }] }], Stop: [{ hooks: [{ type: 'command', command: 'say done' }] }] } }));
+  installHook({ file, command: 'ccpager hook run' }); installHook({ file, command: 'ccpager hook run' });
+  let s = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(s.hooks.PreToolUse.length, 2); assert.equal(s.env.A, '1'); assert.equal(s.hooks.Stop.length, 1);
+  assert.equal(hookInstalled(file), true);
+  installHook({ file, remove: true });
+  s = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(s.hooks.PreToolUse.length, 1); assert.equal(s.hooks.PreToolUse[0].matcher, 'Write');
+  assert.equal(hookInstalled(file), false);
+});
+
 console.log('updates');
 await test('version comparison and release parsing', () => {
   assert.equal(compareVersions('0.6.0', '0.5.9'), 1); assert.equal(compareVersions('v0.6.0', '0.6.0'), 0);
@@ -455,11 +584,11 @@ await test('on/off/status/stats commands', () => {
   const env = { ...process.env, HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'home-')), CCPAGER_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'ccp-')), CCPAGER_PORT: '18765' };
   const cli = (...a) => execFileSync(process.execPath, ['bin/ccpager.js', ...a], { env, encoding: 'utf8' });
   assert.match(cli('off'), /OFF: requests now pass through unchanged/);
-  assert.match(cli('on', 'routing'), /ON  paging on · cache off · routing on · protect on · updates on/); // 1h upgrade is off by default
+  assert.match(cli('on', 'routing'), /ON  paging on · fresh on · cache off · routing on · protect on · updates on/); // 1h upgrade is off by default
   assert.match(cli('on', 'cache'), /cache 1h/);
   assert.match(cli('off', 'cache'), /cache off/);
   assert.throws(() => execFileSync(process.execPath, ['bin/ccpager.js', 'off', 'bogus'], { env, encoding: 'utf8', stdio: 'pipe' }));
-  assert.match(cli('status'), /mode      ON  paging on · cache off · routing on · protect on · updates on/);
+  assert.match(cli('status'), /mode      ON  paging on · fresh on · cache off · routing on · protect on · updates on/);
   assert.match(cli('status'), /protect   armed/);
   assert.match(cli('off', 'protect'), /protect off/);
   assert.match(cli('status'), /usage     not seen yet/);

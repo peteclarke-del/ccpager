@@ -139,6 +139,7 @@ export function pageRequest(body, opts, session = null, now = Date.now()) {
   const target = canMove ? eligible : s.boundary;
 
   const { found, uses } = candidates(messages, target > 0 ? steps[target] : 0, opts);
+  for (const id of opts.pinned || []) found.delete(id);   // bases of fresh-result diffs stay in full
   const fresh = [...found].filter(([id]) => !s.stubbed.has(id));
 
   if (canMove && fresh.length) {
@@ -200,7 +201,8 @@ export class Sessions {
   get(body, now = Date.now()) {
     const k = this.key(body);
     let s = this.map.get(k);
-    if (!s || (s.lastAt != null && now - s.lastAt > this.idleMs)) s = { stubbed: new Map(), boundary: 0, lastAt: null, ttl: s?.ttl || null };
+    if (!s || (s.lastAt != null && now - s.lastAt > this.idleMs)) s = { stubbed: new Map(), fresh: new Map(), boundary: 0, lastAt: null, ttl: s?.ttl || null };
+    s.fresh ||= new Map();
     this.map.delete(k); this.map.set(k, s); // LRU order
     while (this.map.size > this.max) this.map.delete(this.map.keys().next().value);
     return s;
