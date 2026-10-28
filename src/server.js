@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { Readable } from 'node:stream';
 import { pageRequest, Sessions, noteUsage } from './pager.js';
+import { compressFresh, pinnedBases } from './fresh.js';
 import { extendCacheTtl, routeModel } from './transforms.js';
 import { parseLimitHeaders, summarizeLimits } from './limits.js';
 import { protectDecision, applyProtect } from './protect.js';
@@ -11,10 +12,15 @@ import { VERSION } from './version.js';
 const HOP = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'keep-alive', 'accept-encoding']);
 
 export function transform(body, config, session = null, protect = { active: false }) {
-  const report = { pagedBlocks: 0, charsSaved: 0, upgraded: 0, routed: null, protect: protect.active ? protect.reason : null };
+  const report = { pagedBlocks: 0, charsSaved: 0, freshBlocks: 0, freshChars: 0, upgraded: 0, routed: null, protect: protect.active ? protect.reason : null };
   if (config.paging) {
-    const r = pageRequest(body, config, session);
+    const r = pageRequest(body, { ...config, pinned: pinnedBases(body.messages, session) }, session);
     body = r.body; Object.assign(report, r.stats);
+  }
+  if (config.fresh && session) {   // cache-safe: decides only on the newest message, replays older decisions
+    const f = compressFresh(body.messages, session, { rereadDiff: config.rereadDiff });
+    if (f.freshBlocks) body = { ...body, messages: f.out };
+    report.freshBlocks = f.freshBlocks; report.freshChars = f.charsSaved; report.charsSaved += f.charsSaved;
   }
   const t = extendCacheTtl(body, config.cacheTtl);
   body = t.body; report.upgraded = t.upgraded;
@@ -121,7 +127,7 @@ export function createServer(config, log = console) {
           const why = report.moved ? ` cutoff moved (${report.reason}${report.rewriteChars ? `, cache rewrite ~${Math.round(report.rewriteChars / 4)}tok` : ''})`
             : report.held ? ` held: ${report.held}, ~${Math.round(report.pendingChars / 4)}tok waiting`
             : cfg.paging && !report.pagedBlocks ? ` next cutoff in ${report.stepsUntil} steps` : '';
-          log.log(`${req.url.split('?')[0]} model=${out.body.model} msgs=${turns} paged=${report.pagedBlocks} saved=~${Math.round(report.charsSaved / 4)}tok ttl+=${report.upgraded}${report.routed ? ` routed→${report.routed.to} (${report.routed.why})` : ''}${why}`);
+          log.log(`${req.url.split('?')[0]} model=${out.body.model} msgs=${turns} paged=${report.pagedBlocks}${report.freshBlocks ? ` fresh=${report.freshBlocks}` : ''} saved=~${Math.round(report.charsSaved / 4)}tok ttl+=${report.upgraded}${report.routed ? ` routed→${report.routed.to} (${report.routed.why})` : ''}${why}`);
         } catch (e) {
           log.warn('transform skipped, forwarded unchanged:', e.message); // fail open
         }

@@ -6,6 +6,8 @@ A local, open-source take on what Vachi AI does: a gateway that sits between Cla
 
 | Vachi feature | ccpager |
 |---|---|
+| Fresh tool output tidied (cache-safe) | On by default. New tool results lose colour codes, progress bars, trailing space, blank-line and repeated-line runs, and pretty-printing of JSON; a re-read of a file that is still in context is sent as "identical to message N" or as a unified diff against it. Decided once, when the result is newest, then replayed byte-for-byte so the cache prefix is never disturbed (see "Fresh results"). |
+| Bash output trimmed at the source | Opt-in `ccpager hook install`: a Claude Code hook rewrites noisy commands (`git status`, `npm test`, `pytest`, `cargo build`…) to their quiet forms before they run, so the output is small in every request that carries it. Pipelines and anything with redirection are left exactly as typed, and your permission prompts are unchanged. |
 | Context paging (stale context removed) | Old tool results (file reads, test output, grep dumps) older than the last 6 tool steps are replaced with a one-line stub, but only when that's cheaper than leaving them (see below). Reads of a file that was read again later are paged as superseded. |
 | Extended caching windows | Opt-in. Upgrades every `cache_control: ephemeral` breakpoint to `ttl: "1h"`. Off by default because Claude Code now requests the 1-hour cache itself where it pays (see "Cache TTL"). |
 | Turn-level model routing (Vachi: "coming soon") | Opt-in. Short, clearly light instructions ("rename this variable") go to Haiku; anything mid-task or heavy stays on your model. |
@@ -18,7 +20,7 @@ A local, open-source take on what Vachi AI does: a gateway that sits between Cla
 **Debian / Ubuntu package** (recommended): download `ccpager_<version>_all.deb` from the [latest release](https://github.com/peteclarke-del/ccpager/releases/latest) and install it:
 
 ```bash
-sudo apt install ./ccpager_0.6.0_all.deb
+sudo apt install ./ccpager_0.7.0_all.deb
 ```
 
 That installs the `ccpager` command, adds **ccpager** to your app menu and pulls in Node.js and the GTK libraries. It works on any architecture.
@@ -121,7 +123,7 @@ No restart, no VS Code reload. The change applies to the next request:
 ```bash
 ccpager off            # pure pass-through: requests forwarded byte-for-byte unchanged
 ccpager on             # back on
-ccpager off routing    # or toggle one feature: paging | cache | routing | protect | updates
+ccpager off routing    # or toggle one feature: paging | fresh | cache | routing | protect | updates
 ccpager on routing
 ```
 
@@ -205,6 +207,24 @@ Benchmark (simulated: a 200-step Opus 5.5 session with varied tool-output sizes,
 
 So expect a modest saving that grows with breaks and resumed sessions, and almost no auto-compactions. `keepTurns 4` saves more in this benchmark but the benchmark doesn't price the extra tool calls the model makes when it needs a file it read 5 steps ago, so 6 is the default; try 4 if your sessions are mostly long, linear investigations. The script is `test/bench.js`.
 
+## Fresh results
+
+Paging only acts on history, so every tool output is sent in full at least once and written to the cache at full size. The fresh-result stage shrinks it before that first send, with two rules that keep every piece of information a reader could use:
+
+- **tidy**: strip ANSI colour, keep only the final state of lines redrawn with carriage returns (progress bars), drop trailing whitespace, collapse runs of blank lines, fold runs of identical lines into `line   [× N]`, and minify a result that is one large pretty-printed JSON document. Applied only when it saves at least 10% and 200 characters, so ordinary file reads are untouched.
+- **re-read**: when a tool reads the same file as an earlier result still in context, an unchanged file becomes a one-line reference to that message and a slightly changed one becomes a unified diff against it (used only when the diff is under 60% of the file). The earlier read is then pinned so paging cannot stub it out from under the diff.
+
+The decision is made once, on the newest message only, and remembered per session; on every later request the same bytes are sent, so this never invalidates the prompt cache. Error results and results already paged are left alone. `ccpager stats` reports fresh results tidied. Turn it off with `ccpager off fresh`; `CCPAGER_REREAD_DIFF=false` keeps tidy but not diffs.
+
+## Bash output hook
+
+```bash
+ccpager hook install     # adds a PreToolUse hook for Bash to ~/.claude/settings.json
+ccpager hook remove
+```
+
+The hook rewrites a known list of noisy commands into quieter forms with the same information: `git status` → `git status --short --branch`, `git log` → `--oneline -n 30`, `npm install` without the funding and audit banners, `npm test`/`pytest`/`jest` with quiet flags and the last 60–80 lines, `cargo`/`make`/`docker build` quiet, `curl`/`wget` silent, `ls -la` capped at 100 lines, and so on. Only a bare simple command is rewritten: anything with a pipe, `&&`, redirection, `$(...)` or a heredoc was written on purpose and runs as typed. The hook never sets a permission decision, so your normal prompts still apply to the rewritten command. Applies to new Claude Code sessions.
+
 ## Cache TTL
 
 Claude Code decides the cache TTL itself: on a Claude subscription within plan usage the main conversation gets the 1-hour cache, subagents and helpers get 5 minutes, and everything gets 5 minutes on an API key or when the subscription is on usage credits. ccpager's "1-hour cache" switch forces `ttl: "1h"` onto every breakpoint, which doubles the write price for subagents that never idle, so it is **off by default**. If you use an API key and pause between turns, prefer Claude Code's own `promptCacheTtl: "1h"` setting (v2.1.242+), which upgrades only the main conversation; `ccpager on cache` is the blunt alternative. `ccpager stats` shows which tier your writes actually land on.
@@ -228,6 +248,8 @@ ccpager enable --project ~/code/billing-api    # just one project
 
 | Env var | Default | Meaning |
 |---|---|---|
+| `CCPAGER_FRESH` | `true` | tidy fresh tool results and send re-reads as diffs |
+| `CCPAGER_REREAD_DIFF` | `true` | the re-read part of the above |
 | `CCPAGER_KEEP_TURNS` | 6 | recent tool steps sent verbatim |
 | `CCPAGER_PAGE_STEP` | 8 | minimum steps between cutoff moves |
 | `CCPAGER_PAGING_MODE` | `smart` | `always` pages at every step boundary regardless of cache cost |

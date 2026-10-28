@@ -31,6 +31,8 @@ export class Stats {
     const d = this.data;
     d.requests++;
     d.pagedBlocks += r.pagedBlocks || 0;
+    d.freshBlocks = (d.freshBlocks || 0) + (r.freshBlocks || 0);
+    d.freshChars = (d.freshChars || 0) + (r.freshChars || 0);
     d.charsSaved += r.charsSaved || 0;
     d.ttlUpgrades += r.upgraded || 0;
     if (r.routed) { d.routed++; if (r.routed.why === 'protect') d.protected = (d.protected || 0) + 1; }

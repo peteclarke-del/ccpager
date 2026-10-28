@@ -1,7 +1,7 @@
 {
   "name": "ccpager",
-  "version": "0.6.0",
-  "description": "Local gateway for Claude Code: pages stale context out of each request, extends prompt-cache TTL, optional model routing.",
+  "version": "0.7.0",
+  "description": "Local gateway for Claude Code: tidies fresh tool output, pages stale context out of each request, shows plan usage with a predicted run-out, and protects the usage limit.",
   "type": "module",
   "bin": { "ccpager": "bin/ccpager.js" },
   "scripts": {

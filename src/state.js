@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const FEATURES = { paging: 'paging', cache: 'cacheTtl', routing: 'routing', protect: 'protect', updates: 'updateCheck' };
+export const FEATURES = { paging: 'paging', fresh: 'fresh', cache: 'cacheTtl', routing: 'routing', protect: 'protect', updates: 'updateCheck' };
 
 export const statePath = (dataDir) => path.join(dataDir, 'state.json');
 
@@ -58,6 +58,7 @@ export function parseSetting(name, value) {
 export function effectiveConfig(config, state) {
   const c = { ...config, enabled: state.enabled !== false };
   if (typeof state.paging === 'boolean') c.paging = state.paging;
+  if (typeof state.fresh === 'boolean') c.fresh = state.fresh;
   if (typeof state.routing === 'boolean') c.routing = state.routing;
   if (typeof state.protect === 'boolean') c.protect = state.protect;
   if (typeof state.updates === 'boolean') c.updateCheck = state.updates;
