@@ -6,6 +6,7 @@ import { parseLimitHeaders, summarizeLimits } from './limits.js';
 import { protectDecision, applyProtect } from './protect.js';
 import { Stats } from './stats.js';
 import { liveConfig } from './state.js';
+import { VERSION } from './version.js';
 
 const HOP = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'keep-alive', 'accept-encoding']);
 
@@ -83,7 +84,7 @@ export function createServer(config, log = console) {
       if (req.url === '/ccpager/health') {
         res.setHeader('content-type', 'application/json');
         const p = protectNow(cfg);
-        res.end(JSON.stringify({ ok: true, pid: process.pid, startedAt, requests: stats.data.requests, inflight: server.inflight,
+        res.end(JSON.stringify({ ok: true, version: VERSION, pid: process.pid, startedAt, requests: stats.data.requests, inflight: server.inflight,
           logFile: log.file || null, protect: { active: p.active, reason: p.reason },
           config: { port: cfg.port, enabled: cfg.enabled, paging: cfg.paging, cacheTtl: cfg.cacheTtl, routing: cfg.routing, protect: cfg.protect } }));
         return;

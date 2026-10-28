@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.ccpager</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>ccpager</name>
+  <summary>Trim Claude Code requests before they count against your plan</summary>
+  <description>
+    <p>ccpager is a local gateway between Claude Code and the Anthropic API. It pages stale tool output out of each request when that is cheaper than resending it, shows your plan's 5-hour and weekly usage with a predicted run-out time, and can start new sessions on a cheaper model when a limit is under pressure.</p>
+  </description>
+  <launchable type="desktop-id">io.github.ccpager.desktop</launchable>
+  <url type="homepage">https://github.com/peteclarke-del/ccpager</url>
+  <url type="bugtracker">https://github.com/peteclarke-del/ccpager/issues</url>
+  <developer id="io.github.peteclarke-del"><name>Pete Clarke</name></developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.6.0" date="2026-10-28">
+      <description><p>Cache-aware paging, plan usage gauges with run-out prediction, adaptive protection of the usage limit, in-app updates, and a Debian package.</p></description>
+    </release>
+  </releases>
+</component>
