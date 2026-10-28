@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        node: ["18", "22"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test
+      - name: Validate desktop integration and scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils appstream
+          python3 -m py_compile gui/ccpager_gui.py test/gui_test.py
+          desktop-file-validate packaging/io.github.ccpager.desktop
+          appstreamcli validate --no-net packaging/io.github.ccpager.metainfo.xml
+          bash -n packaging/build-deb.sh packaging/check-release-tag.sh install.sh
+      - name: Build the package
+        run: ./packaging/build-deb.sh dist && dpkg-deb --info dist/*.deb

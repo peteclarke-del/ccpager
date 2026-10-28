@@ -30,6 +30,7 @@ CLI = os.path.join(HERE, "..", "bin", "ccpager.js")
 MODELS = ["claude-haiku-5-5", "claude-sonnet-5-5"]
 DEFAULTS = {"keepTurns": 6, "pageStep": 8, "minChars": 1200, "largeContext": 0, "protectAt": 80, "pagingMode": "smart", "smallModel": "claude-haiku-5-5", "protectModel": "claude-sonnet-5-5"}
 DESKTOP_FILE = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "applications", f"{APP_ID}.desktop")
+SYSTEM_DESKTOP_FILE = f"/usr/share/applications/{APP_ID}.desktop"  # installed by the Debian package
 
 
 def fmt_tok(n):
@@ -87,10 +88,10 @@ class Cli:
     def __init__(self, node):
         self.node = node
 
-    def run(self, args, done=None):
+    def run(self, args, done=None, timeout=60):
         def work():
             try:
-                p = subprocess.run([self.node, CLI, *args, "--json"], capture_output=True, text=True, timeout=60)
+                p = subprocess.run([self.node, CLI, *args, "--json"], capture_output=True, text=True, timeout=timeout)
                 out = p.stdout.strip().splitlines()
                 try:
                     res = json.loads(out[-1]) if out else {}
@@ -141,7 +142,7 @@ class Window(Adw.ApplicationWindow):
         self.spinner = Gtk.Spinner()
         header.pack_end(self.spinner)
         refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh")
-        refresh.connect("clicked", lambda *_: self.refresh())
+        refresh.connect("clicked", lambda *_: (self.refresh(), self.check_update(force=True)))
         header.pack_end(refresh)
         bar = Adw.ViewSwitcherBar(stack=self.stack)
         title.connect("notify::title-visible", lambda t, _p: bar.set_reveal(t.get_title_visible()))
@@ -160,6 +161,7 @@ class Window(Adw.ApplicationWindow):
         self.build_logs()
 
         self.refresh()
+        GLib.timeout_add_seconds(2, lambda: (self.check_update(), False)[1])
         GLib.timeout_add_seconds(3, self._tick)
 
     # ---------- plumbing ----------
@@ -251,6 +253,15 @@ class Window(Adw.ApplicationWindow):
         self.warn_row.add_suffix(fix)
         self.warn_row.set_visible(False)
         g.add(self.warn_row)
+
+        self.update_row = Adw.ActionRow(title="Update available")
+        self.update_row.add_prefix(Gtk.Image(icon_name="software-update-available-symbolic"))
+        self.update_btn = Gtk.Button(label="Update & restart", valign=Gtk.Align.CENTER)
+        self.update_btn.add_css_class("suggested-action")
+        self.update_btn.connect("clicked", self.on_update)
+        self.update_row.add_suffix(self.update_btn)
+        self.update_row.set_visible(False)
+        g.add(self.update_row)
         page.add(g)
 
         ug = Adw.PreferencesGroup(title="Plan usage",
@@ -413,6 +424,54 @@ class Window(Adw.ApplicationWindow):
         on = sw.get_active()
         self.act(["on" if on else "off"], "Optimizations on" if on else "Off: requests now pass through unchanged", sw)
 
+    def check_update(self, force=False):
+        if not (self.status or {}).get("mode", {}).get("updates", True) and not force:
+            return
+        self.cli.run(["update", "--check", *(["--force"] if force else [])], self.apply_update, timeout=30)
+
+    def apply_update(self, u):
+        self.update_info = u if u.get("ok") and u.get("newer") else None
+        if not self.update_info:
+            self.update_row.set_visible(False)
+            if u.get("error") and not u.get("latest"):
+                self.toast(f"Couldn't check for updates: {u['error']}")
+            return
+        kind = u.get("kind")
+        notes = (u.get("notes") or "").strip().splitlines()
+        first = next((l.lstrip("#-* ").strip() for l in notes if l.strip()), "")
+        how = {"git": "Pulls the new code, then restarts the gateway and this window.",
+               "deb": "Downloads and installs the package (your desktop asks for your password), then restarts the gateway and this window.",
+               "manual": "This copy was unpacked by hand, so download the new version from the release page."}[kind if kind in ("git", "deb") else "manual"]
+        self.update_row.set_title(f"Version {u['latest']} is available (you have {u['current']})")
+        self.update_row.set_subtitle((first + "\n" if first else "") + how)
+        self.update_btn.set_label("Update & restart" if kind in ("git", "deb") else "Open release page")
+        self.update_row.set_visible(True)
+
+    def on_update(self, btn):
+        u = getattr(self, "update_info", None) or {}
+        if u.get("kind") not in ("git", "deb"):
+            Gtk.UriLauncher.new(u.get("url") or "https://github.com/peteclarke-del/ccpager/releases").launch(self, None, None)
+            return
+        btn.set_sensitive(False)
+        self.toast("Updating…")
+
+        def done(res):
+            btn.set_sensitive(True)
+            if not res.get("ok"):
+                self.toast(f"Update failed: {res.get('error', 'unknown error')}")
+                return
+            if not res.get("updated"):
+                self.toast("Already up to date")
+                self.update_row.set_visible(False)
+                return
+            self.toast(f"Updated to {res.get('to')}. Reopening…")
+            GLib.timeout_add(1200, self.relaunch)
+        self.cli.run(["update"], done, timeout=600)
+
+    def relaunch(self):
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+        return False
+
     def on_gateway_button(self, btn):
         s = self.status or {}
         if s.get("gateway", {}).get("running"):
@@ -565,6 +624,7 @@ class Window(Adw.ApplicationWindow):
             ("cache", "Force the 1-hour cache window", "Off by default: Claude Code already asks for the 1-hour cache where it pays (your main conversation on a subscription) and uses 5 minutes for subagents, where an hour costs double to write. Turn on only with an API key, or set promptCacheTtl in Claude Code instead"),
             ("routing", "Model routing", "Send short, simple instructions to a smaller model. Off by default: switching models starts that turn's cache cold"),
             ("protect", "Protect the usage limit", "When a usage window would run out before it resets (or passes the threshold below), start new sessions such as subagents on the protect model and route light turns to the small model, until the pace is safe. Conversations already under way are never switched"),
+            ("updates", "Check for updates", "Looks at ccpager's GitHub releases page once a day and shows a notice on Overview when a newer version exists. Nothing else is sent"),
         ]:
             sw = Gtk.Switch()
             sw.connect("notify::active", self.guarded(lambda s, _p, n=name: self.act(
@@ -729,16 +789,23 @@ class Window(Adw.ApplicationWindow):
             for c in ("success", "error"):
                 self.gw_icon.remove_css_class(c)
             self.gw_icon.add_css_class("success" if running else "error")
+            ver = f" · v{s['version']}" if s.get("version") else ""
             if g.get("legacy"):
                 self.gw_row.set_subtitle("An older ccpager is running. Restart to update it.")
+            elif s.get("restartNeeded"):
+                self.gw_row.set_subtitle(f"Running v{g.get('version')}, but v{s['version']} is installed. Restart to use it.")
             else:
-                self.gw_row.set_subtitle(f"Running on {g['url']}" + (f" · {s['service']}" if s.get("service") else " · not set to run at login")
-                                         if running else "Not running")
+                self.gw_row.set_subtitle(f"Running on {g['url']}" + (f" · {s['service']}" if s.get("service") else " · not set to run at login") + ver
+                                         if running else "Not running" + ver)
             self.gw_btn.set_label("Restart" if running else "Start")
+            if s.get("restartNeeded") or g.get("legacy"):
+                self.gw_btn.add_css_class("suggested-action")
+            else:
+                self.gw_btn.remove_css_class("suggested-action")
 
             m = s["mode"]
             self.master.set_active(m["enabled"])
-            on = [n for n in ("paging", "cache", "routing", "protect") if m[n]]
+            on = [n for n in ("paging", "cache", "routing", "protect") if m.get(n)]
             if m.get("protect") and s.get("protect", {}).get("active"):
                 on = [n for n in on if n != "protect"] + [f"protect ACTIVE ({s['protect']['reason']})"]
             self.master_row.set_subtitle(("On: " + ", ".join(on) if on else "On, but every feature is switched off")
@@ -770,7 +837,9 @@ class Window(Adw.ApplicationWindow):
                 self.svc_btn.remove_css_class(c)
             if not s.get("service"):
                 self.svc_btn.add_css_class("suggested-action")
-            self.menu_sw.set_active(os.path.exists(DESKTOP_FILE))
+            packaged = os.path.exists(SYSTEM_DESKTOP_FILE)
+            self.menu_sw.set_active(packaged or os.path.exists(DESKTOP_FILE))
+            self.menu_sw.set_sensitive(not packaged)
 
             st = s["settings"]
             help_ = s.get("settingsHelp", {})
