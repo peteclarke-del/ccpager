@@ -11,12 +11,12 @@ A local, open-source take on what Vachi AI does: a gateway that sits between Cla
 | Turn-level model routing (Vachi: "coming soon") | Opt-in. Short, clearly light instructions ("rename this variable") go to Haiku; anything mid-task or heavy stays on your model. |
 | Usage insights | `ccpager stats`: tokens removed, net value after cache rewrites, cache hit rate. `ccpager usage`: your plan's 5-hour session and weekly limits, pace, and the predicted run-out time. |
 | Adaptive protection | On by default. When a usage window would run out before it resets (or passes 80%), new sessions such as subagents start on Sonnet and light turns go to Haiku until the pace is safe. Conversations already under way are never switched (see "Protecting the limit"). |
-| Zero data retention | Only counters are written to `~/.ccpager/stats.json`. |
+| Zero data retention | No prompts or responses are stored. `~/.ccpager/stats.json` holds counters and the plan-usage percentages read from response headers; the log holds one line of counts per request. |
 
 ## Quick start on a Linux desktop
 
 ```bash
-unzip ccpager.zip && cd ccpager
+git clone https://github.com/peteclarke-del/ccpager.git && cd ccpager
 ./install.sh
 ```
 
@@ -32,7 +32,7 @@ The window needs GTK 4 + libadwaita for Python, already present on most GNOME de
 
 - **Overview**: gateway status, the master on/off switch, where ccpager is in use, **plan usage** (5-hour session window and weekly cap as gauges, with time elapsed, reset time, current pace and the predicted run-out time, updating as you work), and a Savings card in three sections: tokens kept out, money (value of tokens kept out, cost of cache rewrites, the net, and the uncached ceiling) and limit (extra work that fits within your limit, and the extra time that buys per 5-hour window at your current pace), each for today, 7 days and all time. A red warning appears if Claude Code is pointed at ccpager while the gateway is down, with a one-click fix.
 - **Setup**: run at login, route **all Claude Code apps** (VS Code, JetBrains, desktop app, CLI) or only **specific project folders**, add/remove the app-menu launcher, and remove everything.
-- **Settings**: paging, 1-hour cache and model routing switches; the small model; tuning (turns kept, paging step, minimum size); local port. Changes save immediately and apply to the next request; a port change restarts the gateway and updates Claude Code's settings for you.
+- **Settings**: paging, 1-hour cache, model routing and limit-protection switches; the small model; tuning (steps kept, paging step, minimum size, large-context threshold, protection threshold); local port. Changes save immediately and apply to the next request; a port change restarts the gateway and updates Claude Code's settings for you. The protect model is set from the terminal (`ccpager set protectModel ...`).
 - **Logs**: one line per request, following live.
 
 The window runs the same `ccpager` commands you can type, so the window and the terminal always agree. Everything is saved in `~/.ccpager/state.json`.
@@ -87,6 +87,7 @@ Each request logs one line ending with why it did or didn't page:
 model=claude-opus-5-5 msgs=37 paged=0 saved=~0tok next cutoff in 1 steps
 model=claude-opus-5-5 msgs=83 paged=8 saved=~17192tok held: cache warm, ~21028tok waiting
 model=claude-opus-5-5 msgs=85 paged=29 saved=~56152tok cutoff moved (pays off, cache rewrite ~24750tok)
+model=claude-sonnet-5-5 msgs=1 paged=0 saved=~0tok routed→claude-sonnet-5-5 (protect) next cutoff in 14 steps
 ```
 
 The gateway writes this file itself (`~/.ccpager/ccpager.log`) on every OS. Paging can start after 14 tool steps (6 kept + 8). On a warm cache it often *holds* even then; see "When paging pays off".
@@ -100,7 +101,7 @@ No restart, no VS Code reload. The change applies to the next request:
 ```bash
 ccpager off            # pure pass-through: requests forwarded byte-for-byte unchanged
 ccpager on             # back on
-ccpager off routing    # or toggle one feature: paging | cache | routing
+ccpager off routing    # or toggle one feature: paging | cache | routing | protect
 ccpager on routing
 ```
 
@@ -138,21 +139,23 @@ Conversations already under way are left on their model: switching mid-conversat
 ```
 $ ccpager stats
                                 today         7 days       all time
-  requests                       1610           1860           1860
-  tokens kept out               ~8.6M         ~16.7M         ~16.7M
-  prompt reduced by                5%             8%             8%
-  value saved                   $1.71          $3.33          $3.33
-    − cache rewrites            $7.33         $10.04         $10.04
-  net value saved              −$5.62         −$6.70         −$6.70
-    (if uncached)        up to $34.21   up to $66.69   up to $66.69
-  API cost of the rest         $98.59           $126           $126
+  requests                       1812           2062           2062
+  tokens kept out              ~14.9M         ~23.0M         ~23.0M
+  prompt reduced by                8%            10%            10%
+  value saved                   $3.06          $4.68          $4.68
+    − cache rewrites            $8.13         $10.83         $10.83
+  net value saved              −$5.07         −$6.15         −$6.15
+    (if uncached)        up to $68.63     up to $101     up to $101
+  API cost of the rest           $131           $158           $158
+  extra work in limit           −3.9%          −3.9%          −3.9%
 ```
 
-(That is a real two-day run of version 0.4 with the old defaults, included on purpose: see "When paging pays off" for why it was negative and what changed.)
+(That is a real two-day run of version 0.4 with the old defaults, included on purpose: see "When paging pays off" for why it was negative and what changed. A negative number means ccpager cost more than it saved over that period.)
 
 - **Tokens kept out** is the sum, over every request, of the tokens removed from that request (a block paged at turn 10 counts again at turns 11, 12, … because it would have been resent each time). Estimated at ~4 characters per token.
 - **Value saved** uses per-model API list prices. It's deliberately conservative: removed history would mostly have been a cache read, so that's how it's priced. **Cache rewrites** is the extra cost of moving the cutoff while the cache was warm. **Net** is the number to watch; `ccpager stats` warns when a week's net is negative.
 - **If uncached** is the ceiling, reached when the cache would have expired anyway.
+- **Extra work in limit** is net value as a share of what the requests cost: roughly how many more requests fit before a usage limit. The window also turns this into extra minutes per 5-hour session window at your current pace.
 - **API cost of the rest** is what the requests that actually ran would cost in API credits, using the real usage numbers Anthropic returns, including 1-hour cache writes. A line shows what share of cache writes used the 1-hour and 5-minute tiers, which is how you confirm which TTL you're actually getting.
 - On a Pro/Max plan you don't pay these amounts, but they are the best available guide to your usage limit. Anthropic says cached tokens count less than uncached ones against plan limits, and community measurements put a cache read at roughly 1/60th of a fresh token while cache writes count like fresh input. So **net value saved**, not the raw % of prompt tokens removed, is what tracks your limit: removing tokens that would have been cache reads saves almost nothing, and a cache rewrite costs real limit.
 
@@ -168,7 +171,7 @@ So by default (smart mode) the cutoff only moves when:
 
 When it does move, it moves as far as it can (everything older than the kept steps), because the rewrite costs the same however far it moves and a bigger move delays the next one; moves are then at least `pageStep` steps apart. Otherwise it holds the previous cutoff and the request is byte-identical to the last one, so the cache keeps hitting. The cache window used for "cold" is the one Anthropic actually applied to your session (read from each response), not an assumption.
 
-Version 0.4 also forced a move whenever the context passed 150k tokens, to delay auto-compaction. On a real two-day run that was 40 of 49 moves and cost $10 of rewrites to save $3.30 (net −$6.70). It's now the opt-in `largeContext` setting, off by default: auto-compaction is cheap in tokens (one summary request on a warm cache), so paying for a rewrite every few steps to delay it only makes sense if you value keeping the raw history more than the limit.
+Version 0.4 also forced a move whenever the context passed 150k tokens, to delay auto-compaction. On a real two-day run that was 40 of 49 moves and cost $10.83 of rewrites to save $4.68 (net −$6.15). It's now the opt-in `largeContext` setting, off by default: auto-compaction is cheap in tokens (one summary request on a warm cache), so paying for a rewrite every few steps to delay it only makes sense if you value keeping the raw history more than the limit.
 
 Benchmark (simulated: a 200-step Opus 5.5 session with varied tool-output sizes, warm cache, billed with real caching rules and auto-compaction at 180k tokens, mean of 5 runs):
 
@@ -218,7 +221,7 @@ ccpager enable --project ~/code/billing-api    # just one project
 | `CCPAGER_SMALL_MODEL` | `claude-haiku-5-5` | routing target |
 | `CCPAGER_PAGING` | true | master switch for paging |
 | `CCPAGER_PORT` | 8787 | |
-| `CCPAGER_VERBOSE` | false | log a line per request |
+| `CCPAGER_VERBOSE` | false | echo each request line to the terminal as well as the log file |
 
 ## Honest caveats
 
