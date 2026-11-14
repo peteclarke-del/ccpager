@@ -28,7 +28,7 @@ APP_ID = "io.github.ccpager"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLI = os.path.join(HERE, "..", "bin", "ccpager.js")
 MODELS = ["claude-haiku-5-5", "claude-sonnet-5-5"]
-DEFAULTS = {"keepTurns": 6, "pageStep": 8, "minChars": 1200, "largeContext": 0, "protectAt": 80, "pagingMode": "smart", "smallModel": "claude-haiku-5-5", "protectModel": "claude-sonnet-5-5"}
+DEFAULTS = {"keepTurns": 4, "pageStep": 8, "minChars": 1200, "largeContext": 0, "freshBudget": 24000, "protectAt": 80, "pagingMode": "smart", "smallModel": "claude-haiku-5-5", "protectModel": "claude-sonnet-5-5", "helperMaxTokens": 8000, "helperThink": 4000}
 DESKTOP_FILE = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "applications", f"{APP_ID}.desktop")
 SYSTEM_DESKTOP_FILE = f"/usr/share/applications/{APP_ID}.desktop"  # installed by the Debian package
 
@@ -625,6 +625,8 @@ class Window(Adw.ApplicationWindow):
             ("cache", "Force the 1-hour cache window", "Off by default: Claude Code already asks for the 1-hour cache where it pays (your main conversation on a subscription) and uses 5 minutes for subagents, where an hour costs double to write. Turn on only with an API key, or set promptCacheTtl in Claude Code instead"),
             ("routing", "Model routing", "Send short, simple instructions to a smaller model. Off by default: switching models starts that turn's cache cold"),
             ("protect", "Protect the usage limit", "When a usage window would run out before it resets (or passes the threshold below), start new sessions such as subagents on the protect model and route light turns to the small model, until the pace is safe. Conversations already under way are never switched"),
+            ("helper", "Helper subagents on a cheaper model", "A session whose system prompt marks it as a Claude Code subagent (Explore, a file-search specialist, a helper) starts on the helper model below and stays there, so its cache is never invalidated by a switch. Decided once, at session start. Your main conversation is never moved"),
+            ("terse", "Terse output for helper subagents", "Ask subagent sessions to answer in the fewest tokens, and cap their output and thinking budgets below. Output is the most expensive token (5× input, ~100× a cache read at Opus prices), so this is the largest saving available"),
             ("updates", "Check for updates", "Looks at ccpager's GitHub releases page once a day and shows a notice on Overview when a newer version exists. Nothing else is sent"),
         ]:
             sw = Gtk.Switch()
@@ -647,7 +649,10 @@ class Window(Adw.ApplicationWindow):
             ("pageStep", "Steps between cutoff moves", 1, 100, 1),
             ("minChars", "Smallest output to page (characters)", 0, 1_000_000, 100),
             ("largeContext", "Page anyway above this many prompt tokens (0 = off)", 0, 2_000_000, 10_000),
+            ("freshBudget", "Largest single tool result sent whole in characters (0 = off)", 0, 2_000_000, 2000),
             ("protectAt", "Protect when a usage window passes this percent", 1, 100, 5),
+            ("helperMaxTokens", "Cap on output tokens for helper subagents", 256, 64000, 256),
+            ("helperThink", "Cap on thinking budget for helper subagents (0 = off)", 0, 32000, 500),
         ]:
             sp = Gtk.SpinButton.new_with_range(lo, hi, step)
             sp.set_numeric(True)
@@ -806,7 +811,7 @@ class Window(Adw.ApplicationWindow):
 
             m = s["mode"]
             self.master.set_active(m["enabled"])
-            on = [n for n in ("paging", "fresh", "cache", "routing", "protect") if m.get(n)]
+            on = [n for n in ("paging", "fresh", "cache", "routing", "protect", "helper", "terse") if m.get(n)]
             if m.get("protect") and s.get("protect", {}).get("active"):
                 on = [n for n in on if n != "protect"] + [f"protect ACTIVE ({s['protect']['reason']})"]
             self.master_row.set_subtitle(("On: " + ", ".join(on) if on else "On, but every feature is switched off")

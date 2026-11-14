@@ -78,9 +78,31 @@ const fmtTok = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n 
 const fmtUsd = (n) => (n >= 100 ? `$${n.toFixed(0)}` : n >= 1 ? `$${n.toFixed(2)}` : n > 0 ? `$${n.toFixed(n >= 0.01 ? 2 : 3)}` : '$0');
 function sumDays(byDay, n) {
   const cutoff = new Date(Date.now() - (n - 1) * 864e5).toISOString().slice(0, 10);
-  const b = { requests: 0, tokensSaved: 0, promptTokens: 0, cost: 0, savedLow: 0, savedHigh: 0, rewriteCost: 0 };
+  const b = { requests: 0, tokensSaved: 0, promptTokens: 0, cost: 0, savedLow: 0, savedHigh: 0, rewriteCost: 0,
+    onRequests: 0, offRequests: 0, onPromptTokens: 0, offPromptTokens: 0, onOutput: 0, offOutput: 0,
+    onRounds: 0, offRounds: 0, onCost: 0, offCost: 0 };
   for (const [day, v] of Object.entries(byDay || {})) if (day >= cutoff) for (const k in b) b[k] += v[k] || 0;
   return b;
+}
+
+/**
+ * The gateway records its own traffic both ways: on and off. That gives a baseline from the user's
+ * machine, which is the only honest answer to "how much more work fits per token" — an observed
+ * comparison, not a controlled experiment, and labelled as such where it is printed.
+ */
+function compareStats(byDay) {
+  const acc = { onRequests: 0, onPromptTokens: 0, onOutput: 0, onRounds: 0, onCost: 0,
+    offRequests: 0, offPromptTokens: 0, offOutput: 0, offRounds: 0, offCost: 0 };
+  for (const v of Object.values(byDay || {})) for (const k in acc) acc[k] += v[k] || 0;
+  const side = (pre) => {
+    const n = acc[pre + 'Requests'];
+    const per = (v) => (n ? v / n : null);
+    return { requests: n, promptPerRequest: per(acc[pre + 'PromptTokens']), outputPerRequest: per(acc[pre + 'Output']),
+      roundsPerRequest: per(acc[pre + 'Rounds']), costPerRequest: per(acc[pre + 'Cost']) };
+  };
+  const on = side('on'), off = side('off');
+  const multiplier = on.costPerRequest > 0 && off.costPerRequest > 0 ? off.costPerRequest / on.costPerRequest : null;
+  return { on, off, multiplier };
 }
 const reduced = (b) => (b.tokensSaved + b.promptTokens ? b.tokensSaved / (b.tokensSaved + b.promptTokens) : 0);
 function statsSummary(d) {
@@ -92,6 +114,7 @@ function statsSummary(d) {
     cacheHitRate: totalIn ? u.cacheRead / totalIn : 0, busiestHour: d.byHour.indexOf(Math.max(...d.byHour)),
     pagedBlocks: d.pagedBlocks, freshBlocks: d.freshBlocks || 0, freshChars: d.freshChars || 0, routed: d.routed, protected: d.protected || 0, byModel: d.byModel || {}, requests: d.requests,
     cacheWrite1h: u.cacheWrite1h || 0, cacheWrite5m: u.cacheWrite5m || 0,
+    compare: compareStats(d.byDay),
   };
 }
 
@@ -124,6 +147,24 @@ ${models.length ? `\n  by model\n${models.map(([m, b]) => `    ${m.padEnd(22)} $
   "If uncached" is the ceiling when the cache would have expired anyway. "Extra work in
   limit" is net value as a share of what the requests cost: how many more requests fit.
   Token counts are estimated at ~4 characters per token.`);
+  const cmp = s.compare;
+  if (cmp && cmp.on.requests >= 20 && cmp.off.requests >= 20) {
+    const per = (x) => (x == null ? '–' : fmtTok(Math.round(x)));
+    const money = (x) => (x == null ? '–' : fmtUsd(x));
+    console.log(`
+  with vs without ccpager   (your own traffic, on and off: observational, not a controlled test)
+    ${''.padEnd(24)}${'with'.padStart(14)}${'without'.padStart(14)}
+    ${'requests'.padEnd(24)}${String(cmp.on.requests).padStart(14)}${String(cmp.off.requests).padStart(14)}
+    ${'prompt tokens / request'.padEnd(24)}${per(cmp.on.promptPerRequest).padStart(14)}${per(cmp.off.promptPerRequest).padStart(14)}
+    ${'output tokens / request'.padEnd(24)}${per(cmp.on.outputPerRequest).padStart(14)}${per(cmp.off.outputPerRequest).padStart(14)}
+    ${'tool rounds / request'.padEnd(24)}${(cmp.on.roundsPerRequest ?? 0).toFixed(2).padStart(14)}${(cmp.off.roundsPerRequest ?? 0).toFixed(2).padStart(14)}
+    ${'API cost / request'.padEnd(24)}${money(cmp.on.costPerRequest).padStart(14)}${money(cmp.off.costPerRequest).padStart(14)}`);
+    if (cmp.multiplier) console.log(
+      `  work per token: ${cmp.multiplier.toFixed(2)}× (same mix assumed; run \`ccpager off\` and on for comparable periods)`);
+  } else if (cmp && (cmp.on.requests || cmp.off.requests)) {
+    console.log(`\n  baseline: ${cmp.on.requests} request(s) with ccpager, ${cmp.off.requests} without.` +
+      '\n  To compare, run `ccpager off` for a while (it still counts and logs), then `ccpager on`.');
+  }
   if (s.week.net < 0 && s.week.requests >= 50) console.log(`
   ⚠ Net value this week is negative: cache rewrites cost more than paging saved. That
     happens when the cutoff moves on a warm cache. Check \`ccpager get\`: largeContext
@@ -155,7 +196,8 @@ async function statusObject() {
       global: { file: GLOBAL_SETTINGS, pointed: pointedAt(GLOBAL_SETTINGS) === mine },
       projects: projects().map((dir) => ({ dir, file: targetFile(dir), pointed: pointedAt(targetFile(dir)) === mine })),
     },
-    mode: { enabled: eff.enabled, paging: eff.paging, fresh: eff.fresh, cache: eff.cacheTtl !== 'off', routing: eff.routing, protect: eff.protect, updates: eff.updateCheck },
+    mode: { enabled: eff.enabled, paging: eff.paging, fresh: eff.fresh, cache: eff.cacheTtl !== 'off', routing: eff.routing,
+      protect: eff.protect, helper: eff.helperRouting, terse: eff.terseHelper, updates: eff.updateCheck },
     protect: h?.protect || { active: false, reason: null },
     settings: Object.fromEntries(Object.entries(TUNABLES).map(([n, s]) => [n, eff[s.key]])),
     settingsHelp: Object.fromEntries(Object.entries(TUNABLES).map(([n, s]) => [n, s.help])),
@@ -179,7 +221,7 @@ async function ensureRunning() {
 }
 
 const modeLine = (eff) => (eff.enabled
-  ? `ON  paging ${eff.paging ? 'on' : 'off'} · fresh ${eff.fresh ? 'on' : 'off'} · cache ${eff.cacheTtl === 'off' ? 'off' : eff.cacheTtl} · routing ${eff.routing ? 'on' : 'off'} · protect ${eff.protect ? 'on' : 'off'} · updates ${eff.updateCheck ? 'on' : 'off'}`
+  ? `ON  paging ${eff.paging ? 'on' : 'off'} · fresh ${eff.fresh ? 'on' : 'off'} · cache ${eff.cacheTtl === 'off' ? 'off' : eff.cacheTtl} · routing ${eff.routing ? 'on' : 'off'} · protect ${eff.protect ? 'on' : 'off'} · updates ${eff.updateCheck ? 'on' : 'off'} · helper ${eff.helperRouting ? 'on' : 'off'} · terse ${eff.terseHelper ? 'on' : 'off'}`
   : 'OFF: pass-through, requests forwarded unchanged');
 
 // ---------- commands ----------
@@ -486,7 +528,7 @@ StartupWMClass=io.github.ccpager
   ccpager disable [--project DIR]  send it straight to Anthropic again
   ccpager status           what's running, where it's routed, what's switched on   (--json)
   ccpager logs             recent requests, then follow live
-  ccpager off [feature]    switch optimizations off instantly (all, or paging | fresh | cache | routing | protect | updates)
+  ccpager off [feature]    switch optimizations off instantly (all, or paging | fresh | cache | routing | protect | helper | terse | updates)
   ccpager hook install     trim noisy Bash output at the source (git, npm, pytest…) via a Claude Code hook  (--remove)
   ccpager on [feature]     switch back on
   ccpager set NAME VALUE   change a setting (saved; applies live). \`ccpager get\` lists them

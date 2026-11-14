@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const FEATURES = { paging: 'paging', fresh: 'fresh', cache: 'cacheTtl', routing: 'routing', protect: 'protect', updates: 'updateCheck' };
+export const FEATURES = { paging: 'paging', fresh: 'fresh', cache: 'cacheTtl', routing: 'routing', protect: 'protect', helper: 'helperRouting', terse: 'terseHelper', updates: 'updateCheck' };
 
 export const statePath = (dataDir) => path.join(dataDir, 'state.json');
 
@@ -32,9 +32,13 @@ export const SETTINGS = {
   pagingMode: { key: 'pagingMode', type: 'enum', values: ['smart', 'always'], help: 'smart: page only when the cache is cold or it pays off; always: every step boundary' },
   minChars:   { key: 'minPageChars', type: 'int', min: 0, max: 1_000_000, help: 'tool outputs smaller than this are never paged' },
   largeContext: { key: 'largeContextTokens', type: 'int', min: 0, max: 2_000_000, help: 'above this many prompt tokens, page even on a warm cache to delay auto-compaction (0 = off)' },
+  freshBudget: { key: 'freshBudget', type: 'int', min: 0, max: 2_000_000, help: 'largest mechanical tool result sent whole (a log or hit list); a file read is never elided (0 = off)' },
   smallModel: { key: 'routeSmallModel', type: 'string', pattern: /^[a-z0-9.\-]+$/, help: 'model that light turns are routed to' },
   protectModel: { key: 'protectModel', type: 'string', pattern: /^[a-z0-9.\-]+$/, help: 'model new sessions start on while a usage limit is under pressure' },
   protectAt:  { key: 'protectAt', type: 'int', min: 1, max: 100, help: 'percent of a usage window at which protection kicks in regardless of pace' },
+  helperModel: { key: 'helperModel', type: 'string', pattern: /^[a-z0-9.\-]+$/, help: 'model a helper subagent session starts on (decided once, at session start)' },
+  helperMaxTokens: { key: 'helperMaxTokens', type: 'int', min: 256, max: 64000, help: 'cap on output tokens for helper subagent sessions' },
+  helperThink: { key: 'helperThinkTokens', type: 'int', min: 0, max: 32000, help: 'cap on thinking budget for helper subagent sessions (0 = leave alone)' },
   port:       { key: 'port', type: 'int', min: 1024, max: 65535, help: 'local port the gateway listens on (restarts it)' },
 };
 
@@ -61,6 +65,8 @@ export function effectiveConfig(config, state) {
   if (typeof state.fresh === 'boolean') c.fresh = state.fresh;
   if (typeof state.routing === 'boolean') c.routing = state.routing;
   if (typeof state.protect === 'boolean') c.protect = state.protect;
+  if (typeof state.helper === 'boolean') c.helperRouting = state.helper;
+  if (typeof state.terse === 'boolean') c.terseHelper = state.terse;
   if (typeof state.updates === 'boolean') c.updateCheck = state.updates;
   for (const [name, s] of Object.entries(SETTINGS)) {
     if (name === 'port' || state[name] === undefined) continue;
