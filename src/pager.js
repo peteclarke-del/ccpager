@@ -26,6 +26,14 @@
 import { priceFor } from './pricing.js';
 
 const STUB_PREFIX = '[ccpager: paged out';
+// A stub for a large result carries a compact digest rather than a single line: the head, the lines
+// that look like errors or stack frames, and the tail. Paging exists to remove tokens, not to remove
+// the information the model needs to carry on, because a re-run is far more expensive than the stub:
+// it costs a whole extra tool round (an output turn plus a full-size cache write).
+const DIGEST_MIN_CHARS = 4000;   // smaller results keep the one-line stub
+const DIGEST_MAX_CHARS = 700;    // hard cap: a huge log can never produce a huge stub
+const DIGEST_HEAD = 6, DIGEST_TAIL = 4, DIGEST_SIGNALS = 6;
+const SIGNAL = /(error|fail|fatal|exception|traceback|panic|assert|warning|\u2717|FAIL|ERROR|Error:|at .*:\d+)/;
 // How many more times removed tokens would likely be re-read. Sessions that have already run
 // long tend to run longer (median here ~55 messages, 90th percentile ~180), so the estimate
 // grows with the session: at least 30, at most 150, otherwise the number of steps so far.
@@ -55,12 +63,41 @@ function toolKey(use) {
   return target ? `${use.name}:${target}` : null;
 }
 
-function makeStub(block, use, size, reason) {
-  const text = resultText(block);
-  const firstLine = text.split('\n').find((l) => l.trim())?.slice(0, 160) || '';
+function stubHeader(use, size, reason) {
   const what = use ? `${use.name}${toolKey(use) ? ' ' + toolKey(use).split(':').slice(1).join(':') : ''}` : 'tool output';
-  return `${STUB_PREFIX} — ${what}, ${size} chars, ${reason}. Re-run the tool if you need it again.]` +
-    (firstLine ? `\nfirst line: ${firstLine}` : '');
+  return `${STUB_PREFIX} — ${what}, ${size} chars, ${reason}. Re-run the tool if you need it again.]`;
+}
+
+/** Head, error-ish lines and tail of a large result, capped. Deterministic, so replay is byte-identical. */
+export function digestOf(block, use, size, reason) {
+  const text = resultText(block);
+  const head = stubHeader(use, size, reason);
+  if (text.length < DIGEST_MIN_CHARS) {
+    const firstLine = text.split('\n').find((l) => l.trim())?.slice(0, 160) || '';
+    return head + (firstLine ? `\nfirst line: ${firstLine}` : '');
+  }
+  const lines = text.split('\n').filter((l) => l.trim());
+  const shownHead = lines.slice(0, DIGEST_HEAD).map((l) => '  ' + l.slice(0, 200));
+  const seen = new Set(shownHead);
+  const pick = (list) => {
+    const out = [];
+    for (const l of list) {
+      const k = '  ' + l.slice(0, 200);
+      if (seen.has(k)) continue;
+      seen.add(k); out.push(k);
+    }
+    return out;
+  };
+  const signals = pick(lines.filter((l) => SIGNAL.test(l)).slice(0, DIGEST_SIGNALS));
+  const tail = pick(lines.slice(-DIGEST_TAIL));
+  const elided = Math.max(0, lines.length - shownHead.length - signals.length - tail.length);
+  const out = [head, 'head:', ...shownHead];
+  if (signals.length) out.push('key lines:', ...signals);
+  if (tail.length) out.push('tail:', ...tail);
+  if (elided) out.push(`… ${elided} more line(s) elided (${text.length} chars total)`);
+  const s = out.join('\n');
+  return s.length <= DIGEST_MAX_CHARS ? s
+    : s.slice(0, DIGEST_MAX_CHARS - 20).replace(/\n[^\n]*$/, '') + '\n… (truncated)';
 }
 
 /** Which tool_result blocks before `cutoff` qualify for paging, with their reason. */
@@ -85,8 +122,8 @@ function candidates(messages, cutoff, opts) {
       const use = uses.get(b.tool_use_id);
       const size = resultSize(b);
       const k = toolKey(use);
-      if (k && lastSeen.get(k) > i && size > 200) found.set(b.tool_use_id, { reason: 'superseded by a later call', index: i, size });
-      else if (size >= opts.minPageChars) found.set(b.tool_use_id, { reason: 'stale', index: i, size });
+      if (k && lastSeen.get(k) > i && size > 200) found.set(b.tool_use_id, { reason: 'superseded by a later call', index: i, size, block: b });
+      else if (size >= opts.minPageChars) found.set(b.tool_use_id, { reason: 'stale', index: i, size, block: b });
     }
   }
   return { found, uses };
@@ -100,10 +137,16 @@ function applyStubs(messages, stubbed, uses) {
     const content = m.content.map((b) => {
       if (b.type !== 'tool_result' || !stubbed.has(b.tool_use_id)) return b;
       const size = resultSize(b);
-      const stub = makeStub(b, uses.get(b.tool_use_id), size, stubbed.get(b.tool_use_id));
-      pagedBlocks++; charsSaved += Math.max(0, size - stub.length);
+      const v = stubbed.get(b.tool_use_id);
+      const reason = typeof v === 'string' ? v : v.reason;
+      let text = v && typeof v === 'object' ? v.text : null;
+      if (!text) {
+        text = digestOf(b, uses.get(b.tool_use_id), size, reason);
+        if (v && typeof v === 'object') v.text = text;   // freeze the bytes first sent
+      }
+      pagedBlocks++; charsSaved += Math.max(0, size - text.length);
       changed = true;
-      return { ...b, content: stub };
+      return { ...b, content: text };
     });
     return changed ? { ...m, content } : m;
   });
@@ -161,7 +204,10 @@ export function pageRequest(body, opts, session = null, now = Date.now()) {
     else if (large) reason = 'large context';
 
     if (reason) {
-      for (const [id, f] of found) if (!s.stubbed.has(id)) s.stubbed.set(id, f.reason);
+      // Freeze the stub text now: later requests replay these exact bytes, so the cache prefix is stable.
+      for (const [id, f] of found) {
+        if (!s.stubbed.has(id)) s.stubbed.set(id, { reason: f.reason, text: digestOf(f.block, uses.get(id), f.size, f.reason) });
+      }
       s.boundary = target;
       stats.moved = true; stats.reason = reason;
       if (!cold) stats.rewriteChars = tail;
@@ -194,9 +240,18 @@ export class Sessions {
   constructor(max = 300, idleMs = 3 * 3600_000) { this.map = new Map(); this.max = max; this.idleMs = idleMs; }
   key(body) {
     const m = body?.messages?.[0];
-    const first = m ? (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).slice(0, 2000) : '';
+    const first = m ? (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)) : '';
+    // Claude Code's first message carries an <env> block whose contents change with the cwd, the
+    // platform or the session's environment. Hashing it verbatim used to invent a new session whenever
+    // that happened, which threw away the paging state and made the next warm-cache move a full rewrite.
+    const stable = first
+      .replace(/<env>[\s\S]*?<\/env>/g, '')
+      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+      .slice(0, 2000);
     const uid = body?.metadata?.user_id || '';
-    return `${uid}|${hash(first)}`;
+    const sys = String(typeof body?.system === 'string' ? body.system : JSON.stringify(body?.system ?? '')).slice(0, 200);
+    const tools = (Array.isArray(body?.tools) ? body.tools : []).map((t) => t?.name || '').join(',');
+    return `${uid}|${hash(sys)}|${hash(tools)}|${hash(stable)}`;
   }
   get(body, now = Date.now()) {
     const k = this.key(body);
@@ -215,4 +270,4 @@ function hash(str) { // FNV-1a, enough to tell conversations apart
   return (h >>> 0).toString(16);
 }
 
-export const _internal = { toolKey, STUB_PREFIX };
+export const _internal = { toolKey, STUB_PREFIX, DIGEST_MAX_CHARS };

@@ -23,6 +23,11 @@ const RULES = [
   [/^git log\s+(.*)$/, (m) => /--oneline|--format|--pretty|-n\s|-\d/.test(m[1]) ? `git --no-pager log ${m[1]}` : `git --no-pager log --oneline -n 30 ${m[1]}`],
   [/^git (show|blame)(\s.*)?$/, (m) => `git --no-pager ${m[1]}${m[2] || ''}`],
   [/^git (push|pull|fetch|clone)(\s.*)?$/, (m) => /--quiet|-q\b/.test(m[2] || '') ? null : `git ${m[1]} --quiet${m[2] || ''}`],
+  // search tools: cap the hits and the line width, so a repo-wide search stays readable
+  [/^rg(\s.*)?$/, (m) => /--max-columns|--max-count|--files-with-matches|-l\b/.test(m[1] || '') ? null : `rg --max-columns=250 --max-count=200${m[1] || ''}`],
+  [/^git grep(\s.*)?$/, (m) => /-n\b|--line-number/.test(m[1] || '') ? null : `git grep -n${m[1] || ''}`],
+  [/^grep(\s.*)?$/, (m) => /--max-count|-m\s*\d|-[a-zA-Z]*l\b/.test(m[1] || '') ? null : `grep --max-count=200${m[1] || ''}`],
+  [/^find(\s.*)?$/, (m) => /maxdepth/.test(m[1] || '') ? null : `find${m[1] || ''} | head -n 200`],
   // node ecosystem
   [/^npm (install|i|ci|update|uninstall|remove)(\s.*)?$/, (m) => `npm ${m[1]} --no-fund --no-audit --loglevel=error --no-progress${m[2] || ''}`],
   [/^npm test$/, `${NO_COLOR} npm test --silent 2>&1 | tail -n 60`],
@@ -30,13 +35,19 @@ const RULES = [
   [/^(npx )?(jest|vitest)(\s.*)?$/, (m) => `${NO_COLOR} ${m[1] || ''}${m[2]} --silent${m[3] || ''} 2>&1 | tail -n 80`],
   [/^(pnpm|yarn) (install|add|remove)(\s.*)?$/, (m) => `${m[1]} ${m[2]} --silent${m[3] || ''}`],
   // python
-  [/^(python3? -m )?pytest(\s.*)?$/, (m) => /-q|--quiet/.test(m[2] || '') ? null : `${NO_COLOR} ${m[1] || ''}pytest -q --no-header -p no:cacheprovider${m[2] || ''} 2>&1 | tail -n 80`],
+  [/^(python3? -m )?pytest(\s.*)?$/, (m) => {
+    if (/-q|--quiet/.test(m[2] || '')) return null;
+    const tb = /--tb/.test(m[2] || '') ? '' : ' --tb=short';   // tracebacks: the failing frame, not the framework
+    return `${NO_COLOR} ${m[1] || ''}pytest -q --no-header -p no:cacheprovider${tb}${m[2] || ''} 2>&1 | tail -n 80`;
+  }],
   [/^pip3? install(\s.*)?$/, (m) => /-q\b/.test(m[1] || '') ? null : `pip install -q --progress-bar off${m[1] || ''}`],
   // build tools and others
   [/^cargo (build|test|check|run)(\s.*)?$/, (m) => /-q\b|--quiet/.test(m[2] || '') ? null : `cargo ${m[1]} -q${m[2] || ''}`],
   [/^(go test|go build)(\s.*)?$/, (m) => `${m[1]}${m[2] || ''} 2>&1 | tail -n 80`],
   [/^make(\s.*)?$/, (m) => /-s\b|--silent/.test(m[1] || '') ? null : `make -s${m[1] || ''} 2>&1 | tail -n 80`],
   [/^docker build(\s.*)?$/, (m) => /-q\b|--quiet/.test(m[1] || '') ? null : `docker build -q${m[1] || ''}`],
+  [/^docker logs(\s.*)?$/, (m) => /--tail|-n\s*\d/.test(m[1] || '') ? null : `docker logs --tail 200${m[1] || ''}`],
+  [/^journalctl(\s.*)?$/, (m) => /-n\s*\d|--lines/.test(m[1] || '') ? null : `journalctl -n 200 --no-pager${m[1] || ''}`],
   [/^(curl|wget)(\s.*)?$/, (m) => /-s\b|--silent|-q\b|--quiet/.test(m[2] || '') ? null : `${m[1]} ${m[1] === 'curl' ? '-sS' : '-q'}${m[2] || ''}`],
   [/^(apt|apt-get) (install|update|upgrade)(\s.*)?$/, (m) => `${m[1]} ${m[2]} -q${m[3] || ''}`],
   [/^tree(\s.*)?$/, (m) => /-L\s*\d/.test(m[1] || '') ? null : `tree -L 2 --noreport${m[1] || ''}`],
