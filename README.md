@@ -8,9 +8,10 @@ A local, open-source take on what Vachi AI does: a gateway that sits between Cla
 |---|---|
 | Fresh tool output tidied (cache-safe) | On by default. New tool results lose colour codes, progress bars, trailing space, blank-line and repeated-line runs, and pretty-printing of JSON; a re-read of a file that is still in context is sent as "identical to message N" or as a unified diff against it. Decided once, when the result is newest, then replayed byte-for-byte so the cache prefix is never disturbed (see "Fresh results"). |
 | Bash output trimmed at the source | Opt-in `ccpager hook install`: a Claude Code hook rewrites noisy commands (`git status`, `npm test`, `pytest`, `cargo build`…) to their quiet forms before they run, so the output is small in every request that carries it. Pipelines and anything with redirection are left exactly as typed, and your permission prompts are unchanged. |
-| Context paging (stale context removed) | Old tool results (file reads, test output, grep dumps) older than the last 6 tool steps are replaced with a one-line stub, but only when that's cheaper than leaving them (see below). Reads of a file that was read again later are paged as superseded. |
+| Context paging (stale context removed) | Old tool results (file reads, test output, grep dumps) older than the last 4 tool steps are replaced with a compact digest — the head, the lines that look like errors or stack frames, and the tail, capped at 700 characters — but only when that's cheaper than leaving them (see below). A digest exists so the model does not have to re-run a tool to learn what the stub took away; a re-run is far more expensive than the stub. Reads of a file that was read again later are paged as superseded. |
 | Extended caching windows | Opt-in. Upgrades every `cache_control: ephemeral` breakpoint to `ttl: "1h"`. Off by default because Claude Code now requests the 1-hour cache itself where it pays (see "Cache TTL"). |
-| Turn-level model routing (Vachi: "coming soon") | Opt-in. Short, clearly light instructions ("rename this variable") go to Haiku; anything mid-task or heavy stays on your model. |
+| Turn-level model routing (Vachi: "coming soon") | Opt-in. Short, clearly light instructions ("rename this variable") go to Haiku; anything mid-task or heavy stays on your model. Only applies on a cold cache, since a switch mid-conversation would rewrite it. |
+| Subagents on a cheaper model, and terser | On by default. A session whose system prompt marks it as a Claude Code subagent (Explore, a file-search specialist, a helper) starts on `claude-sonnet-5-5` and stays there for its life, so its cache is never invalidated by a switch, and its output is asked to be terse with capped output and thinking budgets. Decided once, at session start; your main conversation is never moved. The model tier is what moves work-per-token by a factor — `test/bench.js` measures the terse part on its own at around 1% of total cost at 500 output tokens per request, because an agent loop writes little prose next to the prompt it re-reads. |
 | Usage insights | `ccpager stats`: tokens removed, net value after cache rewrites, cache hit rate. `ccpager usage`: your plan's 5-hour session and weekly limits, pace, and the predicted run-out time. |
 | Adaptive protection | On by default. When a usage window would run out before it resets (or passes 80%), new sessions such as subagents start on Sonnet and light turns go to Haiku until the pace is safe. Conversations already under way are never switched (see "Protecting the limit"). |
 | Zero data retention | No prompts or responses are stored. `~/.ccpager/stats.json` holds counters and the plan-usage percentages read from response headers; the log holds one line of counts per request. |
@@ -112,7 +113,7 @@ model=claude-opus-5-5 msgs=85 paged=29 saved=~56152tok cutoff moved (pays off, c
 model=claude-sonnet-5-5 msgs=1 paged=0 saved=~0tok routed→claude-sonnet-5-5 (protect) next cutoff in 14 steps
 ```
 
-The gateway writes this file itself (`~/.ccpager/ccpager.log`) on every OS. Paging can start after 14 tool steps (6 kept + 8). On a warm cache it often *holds* even then; see "When paging pays off".
+The gateway writes this file itself (`~/.ccpager/ccpager.log`) on every OS. Paging can start after 12 tool steps (4 kept + 8). On a warm cache it often *holds* even then; see "When paging pays off".
 
 `CCPAGER_*` settings present when you run `ccpager vscode` are baked into the service; re-run it after changing them. Re-running always replaces the running gateway.
 
@@ -205,14 +206,16 @@ Benchmark (simulated: a 200-step Opus 5.5 session with varied tool-output sizes,
 | 0.4 rule (forced move above 150k) | $14.65 (+16%) | $11.23 (+9%) | $18.28 (+12%) | 17.9M | 0.0 |
 | always | $15.30 (+21%) | $11.54 (+13%) | $19.14 (+17%) | 17.7M | 0.0 |
 
-So expect a modest saving that grows with breaks and resumed sessions, and almost no auto-compactions. `keepTurns 4` saves more in this benchmark but the benchmark doesn't price the extra tool calls the model makes when it needs a file it read 5 steps ago, so 6 is the default; try 4 if your sessions are mostly long, linear investigations. The script is `test/bench.js`.
+So expect a modest saving that grows with breaks and resumed sessions, and almost no auto-compactions. That table is from 0.5, when paging used one-line stubs. Since 0.7 the stub is a digest and `keepTurns` defaults to 4, because `test/bench.js` now prices the re-runs that paging can cause: at 4 it is ahead of 6 in every scenario, and ahead of 6 at every re-run rate the sweep tries (0%, 15%, 40%). `ccpager set keepTurns 6` if your sessions are mostly long, linear investigations. The script is `test/bench.js`; its re-run rates are an assumption, and it says so.
 
 ## Fresh results
 
 Paging only acts on history, so every tool output is sent in full at least once and written to the cache at full size. The fresh-result stage shrinks it before that first send, with two rules that keep every piece of information a reader could use:
 
 - **tidy**: strip ANSI colour, keep only the final state of lines redrawn with carriage returns (progress bars), drop trailing whitespace, collapse runs of blank lines, fold runs of identical lines into `line   [× N]`, and minify a result that is one large pretty-printed JSON document. Applied only when it saves at least 10% and 200 characters, so ordinary file reads are untouched.
-- **re-read**: when a tool reads the same file as an earlier result still in context, an unchanged file becomes a one-line reference to that message and a slightly changed one becomes a unified diff against it (used only when the diff is under 60% of the file). The earlier read is then pinned so paging cannot stub it out from under the diff.
+- **re-read**: when a tool reads the same file as an earlier result still in context, an unchanged file becomes a one-line reference to that message and a slightly changed one becomes a unified diff against it (used only when the diff is under 60% of the file). The earlier read is then pinned so paging cannot stub it out from under the diff; at most the 8 most recent pins are kept, so a long session still pages.
+- **budget**: a single result bigger than `freshBudget` characters (24k by default) keeps its first 120 and last 200 lines and elides the middle with a marker that says how to get it back (offset/limit, `head`, `sed -n`) — aimed at 60k-character test logs, `find` dumps and service logs. It only fires on output that looks mechanical: at least half its non-blank lines are timestamps, log levels, test tallies, stack frames, hit-list entries or commit hashes. A `Read` result is never elided, and neither is `cat src/file.ts`, because source code does not look like that.
+- **matches**: a grep/rg hit list becomes the first 3 matches per file plus `+N more in file`, which is the same thing a reader takes from it. Both are lossy, so they run only on the newest result and say exactly what was removed.
 
 The decision is made once, on the newest message only, and remembered per session; on every later request the same bytes are sent, so this never invalidates the prompt cache. Error results and results already paged are left alone. `ccpager stats` reports fresh results tidied. Turn it off with `ccpager off fresh`; `CCPAGER_REREAD_DIFF=false` keeps tidy but not diffs.
 
@@ -250,7 +253,9 @@ ccpager enable --project ~/code/billing-api    # just one project
 |---|---|---|
 | `CCPAGER_FRESH` | `true` | tidy fresh tool results and send re-reads as diffs |
 | `CCPAGER_REREAD_DIFF` | `true` | the re-read part of the above |
-| `CCPAGER_KEEP_TURNS` | 6 | recent tool steps sent verbatim |
+| `CCPAGER_FRESH_BUDGET` | 24000 | a single *mechanical* tool result (a log, a test run, a hit list) larger than this keeps its head and tail and elides the middle with a marker. A `Read` result is never elided, and a shell command that prints source code is left alone (0 = off) |
+| `CCPAGER_FRESH_MATCHES` | `true` | a long grep/rg hit list becomes the first few matches per file plus a count of the rest |
+| `CCPAGER_KEEP_TURNS` | 4 | recent tool steps sent verbatim |
 | `CCPAGER_PAGE_STEP` | 8 | minimum steps between cutoff moves |
 | `CCPAGER_PAGING_MODE` | `smart` | `always` pages at every step boundary regardless of cache cost |
 | `CCPAGER_MIN_CHARS` | 1200 | smaller tool outputs are never paged |
@@ -259,6 +264,11 @@ ccpager enable --project ~/code/billing-api    # just one project
 | `CCPAGER_PROTECT` | `true` | adaptive protection of the usage limit (see above) |
 | `CCPAGER_PROTECT_MODEL` | `claude-sonnet-5-5` | model new sessions start on while protection is active |
 | `CCPAGER_PROTECT_AT` | 80 | percent of a window at which protection kicks in regardless of pace |
+| `CCPAGER_HELPER_ROUTING` | `true` | start new subagent sessions on `helperModel` (decided once, at session start) |
+| `CCPAGER_HELPER_MODEL` | `claude-sonnet-5-5` | model a helper subagent session starts on |
+| `CCPAGER_TERSE` | `true` | ask helper subagent sessions to answer in the fewest tokens |
+| `CCPAGER_HELPER_MAX_TOKENS` | 8000 | cap on output tokens for helper subagent sessions |
+| `CCPAGER_HELPER_THINK` | 4000 | cap on the thinking budget for helper subagent sessions (0 = leave alone) |
 | `CCPAGER_UPDATE_CHECK` | `true` | look for a newer release once a day |
 | `CCPAGER_ROUTING` | false | turn-level routing |
 | `CCPAGER_SMALL_MODEL` | `claude-haiku-5-5` | routing target |
@@ -269,6 +279,7 @@ ccpager enable --project ~/code/billing-api    # just one project
 ## Honest caveats
 
 - **Savings are modest on a warm cache** (a few percent; see the benchmark), because cache reads are nearly free both in dollars and against plan limits. The wins come from breaks, resumed sessions and avoided compactions. "2X" is Vachi's claim; measure your own with `ccpager stats`, which reports net savings after cache rewrites and warns when they go negative.
+- **Paging alone cannot reach 2×, and the README should not pretend otherwise.** At Opus 5.5 list prices a cache read is 1/20th of a fresh token, so everything paging can remove is cheap by construction. The tokens that actually consume a limit are *cache writes* (new tool output) and *output*, and the largest single lever is which model a session runs on. That is why helper routing and terse output are on by default and paging policies are not: measure with `ccpager stats` (which now compares your own on and off traffic) and with `node test/bench.js`, which prices output and re-runs. A strategy that removes tokens but makes the model re-run tools has saved nothing.
 - **Forcing the 1h cache costs more** on short bursts (the write price is 2× base instead of 1.25×) and Claude Code already requests it where it pays, which is why it's off by default (see "Cache TTL").
 - **Routing switches models**, and the cache is per-model, so a routed turn starts cold. That's why it's off by default.
 - The model occasionally re-runs a tool to recover paged content. That's by design and usually far cheaper than resending it on every turn.

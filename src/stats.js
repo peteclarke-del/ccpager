@@ -6,7 +6,12 @@ import { recordLimits } from './limits.js';
 // Only counts are stored. Prompts and responses are never written to disk.
 const CHARS_PER_TOKEN = 4; // rough estimate for code and logs
 const KEEP_DAYS = 31;
-const emptyBucket = () => ({ requests: 0, tokensSaved: 0, promptTokens: 0, cost: 0, savedLow: 0, savedHigh: 0, rewriteCost: 0 });
+// Counts are kept for the gateway on and off separately, so `ccpager stats` can compare the two
+// from the user's own traffic instead of asking them to trust a claim.
+const BUCKET_KEYS = ['requests', 'tokensSaved', 'promptTokens', 'cost', 'savedLow', 'savedHigh', 'rewriteCost',
+  'onRequests', 'offRequests', 'onPromptTokens', 'offPromptTokens', 'onOutput', 'offOutput',
+  'onRounds', 'offRounds', 'onCost', 'offCost'];
+const emptyBucket = () => { const b = {}; for (const k of BUCKET_KEYS) b[k] = 0; return b; };
 const today = () => new Date().toISOString().slice(0, 10);
 
 export class Stats {
@@ -24,6 +29,11 @@ export class Stats {
     this.data.usage.cacheWrite1h ??= 0;
     this.data.usage.cacheWrite5m ??= 0;
     this.data.limits ||= null;
+    // Older stats files predate the on/off buckets; fill them in rather than start over.
+    const base = emptyBucket();
+    for (const b of [this.data.totals, ...Object.values(this.data.byDay), ...Object.values(this.data.byModel)]) {
+      for (const k of BUCKET_KEYS) if (typeof b[k] !== 'number') b[k] = base[k];
+    }
     this.dirty = false;
     this.timer = setInterval(() => this.flush(), 5000).unref();
   }
@@ -40,7 +50,7 @@ export class Stats {
     this.dirty = true;
   }
   /** Called once a response finishes, with its usage block and what ccpager removed from that request. */
-  usage(u, { model = '', charsSaved = 0, assume1h = false, rewriteChars = 0 } = {}) {
+  usage(u, { model = '', charsSaved = 0, assume1h = false, rewriteChars = 0, off = false, rounds = 0 } = {}) {
     if (!u) return;
     const d = this.data.usage;
     d.input += u.input_tokens || 0;
@@ -55,6 +65,13 @@ export class Stats {
     const add = (b) => {
       b.requests++; b.tokensSaved += tokensSaved; b.promptTokens += promptTokens;
       b.cost += c.cost; b.savedLow += c.savedLow; b.savedHigh += c.savedHigh; b.rewriteCost = (b.rewriteCost || 0) + c.rewriteCost;
+      if (off) {
+        b.offRequests++; b.offPromptTokens += promptTokens; b.offOutput += u.output_tokens || 0;
+        b.offRounds += rounds; b.offCost += c.cost;
+      } else {
+        b.onRequests++; b.onPromptTokens += promptTokens; b.onOutput += u.output_tokens || 0;
+        b.onRounds += rounds; b.onCost += c.cost;
+      }
     };
     add(this.data.totals);
     add((this.data.byDay[today()] ||= emptyBucket()));

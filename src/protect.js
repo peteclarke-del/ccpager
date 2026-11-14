@@ -32,11 +32,29 @@ export function protectDecision(summary, cfg) {
 const isBig = (model) => /opus|fable|mythos/i.test(model || '');
 
 /**
+ * Session-entry model routing for helper/subagent sessions, decided once. A subagent's first request
+ * is the only moment at which changing the model is free (nothing is cached yet); the choice is then
+ * sticky through `session.protectModel`, so its cache survives. `session.kind` is set by the gateway
+ * when the session is first seen.
+ */
+export function applyHelperRouting(body, cfg, session) {
+  if (!cfg.helperRouting || !session || session.protectModel) return { body, routed: null };
+  if (session.kind !== 'helper' || !isBig(body.model)) return { body, routed: null };
+  const to = cfg.helperModel || cfg.protectModel;
+  if (!to || to === body.model) return { body, routed: null };
+  session.protectModel = to;                                          // sticky for the session's life
+  return { body: { ...body, model: to }, routed: { from: body.model, to, why: 'helper' } };
+}
+
+/**
  * Apply protection to one request. `session` is the per-conversation state (may be null for
  * count_tokens). Returns { body, routed, sticky } — `sticky` is true when the session was
  * already routed earlier and is simply kept on its model.
  */
 export function applyProtect(body, decision, cfg, session) {
+  const h = applyHelperRouting(body, cfg, session);   // decided first: no cache exists yet at session start
+  body = h.body;
+  if (h.routed) return { body, routed: h.routed, sticky: false };
   const target = cfg.protectModel;
   if (session?.protectModel) { // keep a routed session on its model, protected or not
     if (body.model === session.protectModel) return { body, routed: null, sticky: true };

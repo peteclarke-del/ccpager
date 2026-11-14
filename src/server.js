@@ -5,28 +5,44 @@ import { compressFresh, pinnedBases } from './fresh.js';
 import { extendCacheTtl, routeModel } from './transforms.js';
 import { parseLimitHeaders, summarizeLimits } from './limits.js';
 import { protectDecision, applyProtect } from './protect.js';
+import { classify } from './session-type.js';
+import { applyTerse } from './terse.js';
 import { Stats } from './stats.js';
 import { liveConfig } from './state.js';
 import { VERSION } from './version.js';
 
 const HOP = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'keep-alive', 'accept-encoding']);
 
+/** A request that carries a new tool result is one tool round of an agent loop. */
+const roundsOf = (b) => {
+  const last = Array.isArray(b?.messages) ? b.messages[b.messages.length - 1] : null;
+  return last?.role === 'user' && Array.isArray(last.content) && last.content.some((x) => x?.type === 'tool_result') ? 1 : 0;
+};
+
 export function transform(body, config, session = null, protect = { active: false }) {
-  const report = { pagedBlocks: 0, charsSaved: 0, freshBlocks: 0, freshChars: 0, upgraded: 0, routed: null, protect: protect.active ? protect.reason : null };
+  const report = { pagedBlocks: 0, charsSaved: 0, freshBlocks: 0, freshChars: 0, upgraded: 0, routed: null,
+    protect: protect.active ? protect.reason : null, rounds: roundsOf(body) };
+  // Pick the session's model first: paging prices a cutoff move from body.model, so the routing
+  // decision has to be made before that estimate. Decided once, at session start, then sticky.
+  const pm = applyProtect(body, protect, config, session);
+  body = pm.body; if (pm.routed) report.routed = pm.routed;
+  body = applyTerse(body, config, session);
   if (config.paging) {
     const r = pageRequest(body, { ...config, pinned: pinnedBases(body.messages, session) }, session);
     body = r.body; Object.assign(report, r.stats);
   }
   if (config.fresh && session) {   // cache-safe: decides only on the newest message, replays older decisions
-    const f = compressFresh(body.messages, session, { rereadDiff: config.rereadDiff });
+    const f = compressFresh(body.messages, session, { rereadDiff: config.rereadDiff, budget: config.freshBudget, matches: config.freshMatches });
     if (f.freshBlocks) body = { ...body, messages: f.out };
     report.freshBlocks = f.freshBlocks; report.freshChars = f.charsSaved; report.charsSaved += f.charsSaved;
   }
   const t = extendCacheTtl(body, config.cacheTtl);
   body = t.body; report.upgraded = t.upgraded;
-  const p = applyProtect(body, protect, config, session);
-  body = p.body; if (p.routed) report.routed = p.routed;
-  if (!p.sticky && !p.routed && (config.routing || protect.active)) {
+  // Turn-level routing is only worth it on a cold cache: switching models mid-conversation starts
+  // that model's cache from scratch, which costs more than the cheaper model saves.
+  const ttl = session?.ttl || (config.cacheTtl === '1h' ? '1h' : '5m');
+  const cold = !session || session.lastAt == null || Date.now() - session.lastAt > (ttl === '1h' ? 55 : 4.5) * 60_000;
+  if (!pm.sticky && !pm.routed && cold && (config.routing || protect.active)) {
     const r = routeModel(body, config.routeSmallModel);
     body = r.body; if (r.routed) report.routed = { ...r.routed, why: 'light turn' };
   }
@@ -107,14 +123,16 @@ export function createServer(config, log = console) {
       const isCount = isMessages && req.url.includes('count_tokens');
       if (isMessages && !cfg.enabled) {
         // Switched off: forward the original bytes untouched, but still log and count usage.
-        let model = ''; try { model = JSON.parse(raw.toString('utf8')).model; } catch {}
-        report = { pagedBlocks: 0, charsSaved: 0, upgraded: 0, routed: null, off: true, model };
+        let model = '', rounds = 0;
+        try { const b = JSON.parse(raw.toString('utf8')); model = b.model; rounds = roundsOf(b); } catch {}
+        report = { pagedBlocks: 0, charsSaved: 0, upgraded: 0, routed: null, off: true, model, rounds };
         if (!isCount) stats.record(report);
         log.log(`${req.url.split('?')[0]} OFF (pass-through, unchanged)`);
       } else if (isMessages) {
         try {
           const parsed = JSON.parse(raw.toString('utf8'));
           session = isCount ? null : sessions.get(parsed); // count_tokens must not advance a session's paging state
+          if (session && !session.kind) session.kind = classify(parsed).kind; // helper subagent or main conversation
           const out = transform(parsed, cfg, session, protectNow(cfg));
           raw = Buffer.from(JSON.stringify(out.body));
           report = out.report;
@@ -158,7 +176,8 @@ export function createServer(config, log = console) {
 
       const tap = report && !isCount && upstream.ok
         ? usageTap(stats, (upstream.headers.get('content-type') || '').includes('event-stream'),
-          { model: report.model, charsSaved: report.charsSaved, assume1h: report.assume1h, rewriteChars: report.rewriteChars || 0, session })
+          { model: report.model, charsSaved: report.charsSaved, assume1h: report.assume1h, rewriteChars: report.rewriteChars || 0, session,
+            off: !!report.off, rounds: report.rounds || 0 })
         : null;
       const stream = Readable.fromWeb(upstream.body);
       stream.on('data', (c) => { tap?.chunk(c); res.write(c); });
