@@ -3,11 +3,11 @@ import http from 'node:http';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
-import { pageRequest, noteUsage } from '../src/pager.js';
+import { pageRequest, noteUsage, digestOf, Sessions } from '../src/pager.js';
 import { parseLimitHeaders, recordLimits, summarizeLimits, formatLimits } from '../src/limits.js';
 import { protectDecision, applyProtect } from '../src/protect.js';
 import { transform } from '../src/server.js';
-import { tidy, lineDiff, compressFresh, pinnedBases } from '../src/fresh.js';
+import { tidy, lineDiff, compressFresh, pinnedBases, budgetText, summarizeMatches, looksMechanical } from '../src/fresh.js';
 import { rewriteCommand, handleHook, installHook, hookInstalled } from '../src/hook.js';
 import { compareVersions, parseRelease, installKind, checkForUpdate, VERSION } from '../src/update.js';
 import { extendCacheTtl, routeModel } from '../src/transforms.js';
@@ -15,6 +15,9 @@ import { createServer } from '../src/server.js';
 import { createLogger } from '../src/log.js';
 import { writeState } from '../src/state.js';
 import { costOf, priceFor } from '../src/pricing.js';
+import { classify } from '../src/session-type.js';
+import { applyTerse } from '../src/terse.js';
+import { Stats } from '../src/stats.js';
 import { execFileSync, execFile } from 'node:child_process';
 
 let pass = 0;
@@ -473,6 +476,85 @@ await test('fresh + paging, step by step like the gateway: a diff pins its base 
   assert.ok(sawDiffPastBase, 'the cutoff moved past the base while the diff was live');
 });
 
+console.log('fresh trims: budget, match summaries and pinned bases');
+await test('budgetText elides the middle of an oversized result and leaves everything else alone', () => {
+  const lines = Array.from({ length: 3000 }, (_, i) => `2026-11-14T10:00:${String(i % 60).padStart(2, '0')}Z INFO processed item ${i}`);
+  const big = lines.join('\n');
+  const b = budgetText(big, 24000);
+  assert.ok(b, 'a six-figure log is trimmed');
+  assert.ok(b.length < big.length / 2);
+  assert.match(b, /of 3000 lines elided; re-run with a narrower range/);
+  assert.ok(b.includes(lines[0]), 'head kept');
+  assert.ok(b.includes(lines[lines.length - 1]), 'tail kept');
+  assert.ok(!b.includes(lines[1500]), 'the middle is what goes');
+  assert.equal(budgetText(big, 0), null, '0 = off');
+  assert.equal(budgetText(big, 10_000_000), null, 'under budget');
+  assert.equal(budgetText('one line '.repeat(5000), 1000), null, 'one long line has no middle to drop');
+  assert.equal(budgetText(Array.from({ length: 350 }, (_, i) => `l${i}`).join('\n'), 24000), null, 'under the budget in chars');
+});
+await test('the budget never elides an ordinary source-file read', () => {
+  const code = Array.from({ length: 700 }, (_, i) => `  const value${i} = compute(${i}, options);`);
+  const src = code.join('\n');
+  assert.ok(src.length > 24000, `the fixture is over the budget (${src.length} chars)`);
+  assert.equal(looksMechanical(src), false);
+  assert.equal(budgetText(src, 24000), null, 'a file read comes whole, however long');
+  const log = Array.from({ length: 3000 }, (_, i) => `ok ${i} - case ${i % 9} completed in ${i % 50}ms`);
+  assert.equal(looksMechanical(log.join('\n')), true);
+  const msgs = (name, input, text) => [
+    { role: 'user', content: [{ type: 'text', text: 'go' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'u1', name, input }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'u1', content: text }] },
+  ];
+  const read = compressFresh(msgs('Read', { file_path: 'src/big.ts' }, src), { fresh: new Map() }, { budget: 24000, matches: true });
+  assert.equal(read.freshBlocks, 0, 'a Read result is never budgeted');
+  const bash = compressFresh(msgs('Bash', { command: 'npm test' }, log.join('\n')), { fresh: new Map() }, { budget: 24000, matches: true });
+  assert.equal(bash.budgeted, 1, 'a test log still is');
+  assert.match(bash.out[2].content[0].content, /lines elided/);
+  // a shell command that cats a source file looks like code, so it is left alone too
+  const cat = compressFresh(msgs('Bash', { command: 'cat src/big.ts' }, src), { fresh: new Map() }, { budget: 24000, matches: true });
+  assert.equal(cat.freshBlocks, 0, 'mechanical means mechanical, not just "not Read"');
+});
+await test('summarizeMatches keeps the first matches per file and counts the rest', () => {
+  const files = 12, per = 10;
+  const text = Array.from({ length: files }, (_, f) =>
+    Array.from({ length: per }, (_, i) => `src/m${f}.ts:${i + 1}:  const t${i} = 1;`).join('\n')).join('\n');
+  const s = summarizeMatches(text);
+  assert.match(s, /^\[ccpager: 120 matches in 12 files; first 3 per file\]/);
+  assert.match(s, /\+7 more in src\/m0\.ts/);
+  assert.equal(s.split('\n').filter((l) => l.startsWith('src/')).length, files * 3, 'three kept lines per file');
+  assert.equal(summarizeMatches('src/a.js:1: only one'), null);
+  assert.equal(summarizeMatches('no matches here\nat all'), null);
+});
+await test('compressFresh applies the budget and the match summary once, then replays them', () => {
+  const log = Array.from({ length: 3000 }, (_, i) => `ok ${i} - case ${i % 41}`).join('\n');
+  const s1 = { fresh: new Map() };
+  const r1 = compressFresh(freshBody([{ target: 'run.log', text: log }]), s1, { budget: 24000, matches: true });
+  assert.equal(r1.freshBlocks, 1);
+  assert.equal(r1.budgeted, 1);
+  const first = r1.out[2].content[0].content;
+  assert.match(first, /lines elided/);
+  assert.equal(compressFresh(freshBody([{ target: 'run.log', text: log }]), s1, { budget: 24000, matches: true }).out[2].content[0].content, first,
+    'the decision replays byte-identically');
+  assert.equal(s1.fresh.size, 1);
+  const r2 = compressFresh(freshBody([{ target: 'run.log', text: log }]), { fresh: new Map() }, { budget: 0, matches: false });
+  assert.equal(r2.freshBlocks, 0, 'budget 0 and matches off leave it alone');
+  const hits = Array.from({ length: 12 }, (_, f) =>
+    Array.from({ length: 10 }, (_, i) => `src/g${f}.ts:${i + 1}:  token ${i}`).join('\n')).join('\n');
+  const r3 = compressFresh(freshBody([{ target: 'src/g0.ts', text: hits }]), { fresh: new Map() }, { budget: 24000, matches: true });
+  assert.equal(r3.matched, 1);
+  assert.match(r3.out[2].content[0].content, /matches in 12 files/);
+});
+await test('pinned bases are capped, keeping the most recent diffs protected', () => {
+  const s = { fresh: new Map(), stubbed: new Map() };
+  for (let i = 0; i < 12; i++) s.fresh.set('d' + i, { text: 'x', base: 'b' + i });
+  const pinned = pinnedBases([], s);
+  assert.equal(pinned.size, 8);
+  assert.ok(pinned.has('b11') && pinned.has('b4'));
+  assert.ok(!pinned.has('b3'), 'older bases may be paged again');
+  s.stubbed.set('d11', { reason: 'stale', text: 'x' });
+  assert.ok(!pinnedBases([], s).has('b11'), 'a diff that was itself paged stops pinning its base');
+});
+
 console.log('bash output hook');
 await test('rewrites noisy commands to quiet equivalents, leaves pipelines and unknown commands alone', () => {
   assert.equal(rewriteCommand('git status'), 'git status --short --branch');
@@ -492,6 +574,24 @@ await test('rewrites noisy commands to quiet equivalents, leaves pipelines and u
   assert.equal(rewriteCommand('echo $HOME'), null);
   assert.equal(rewriteCommand('node bin/ccpager.js status'), null);
   assert.equal(rewriteCommand(''), null); assert.equal(rewriteCommand(42), null);
+});
+await test('search and log commands get bounded, and ones already bounded are left alone', () => {
+  assert.equal(rewriteCommand('rg TODO'), 'rg --max-columns=250 --max-count=200 TODO');
+  assert.equal(rewriteCommand('rg --max-columns=100 TODO'), null);
+  assert.equal(rewriteCommand('rg -l TODO'), null);
+  assert.equal(rewriteCommand('grep -rn foo .'), 'grep --max-count=200 -rn foo .');
+  assert.equal(rewriteCommand('grep -m 5 foo x'), null);
+  assert.equal(rewriteCommand('git grep TODO'), 'git grep -n TODO');
+  assert.equal(rewriteCommand('git grep -n TODO'), null);
+  assert.equal(rewriteCommand('find . -name "*.ts"'), 'find . -name "*.ts" | head -n 200');
+  assert.equal(rewriteCommand('find . -maxdepth 2'), null);
+  assert.equal(rewriteCommand('docker logs web'), 'docker logs --tail 200 web');
+  assert.equal(rewriteCommand('docker logs -n 50 web'), null);
+  assert.equal(rewriteCommand('journalctl -u api'), 'journalctl -n 200 --no-pager -u api');
+  assert.equal(rewriteCommand('journalctl -n 20 -u api'), null);
+  assert.match(rewriteCommand('pytest tests/x.py'), /--tb=short/);
+  const dup = rewriteCommand('pytest --tb=long tests/x.py');
+  assert.equal((dup.match(/--tb/g) || []).length, 1, 'never adds a second --tb');
 });
 await test('handleHook answers Bash only, with updatedInput and no permission decision', () => {
   const out = handleHook(JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'git status', description: 'x' } }));
@@ -577,6 +677,101 @@ await test('cost uses the 1h write rate when the API reports it, and values savi
   assert.equal(+c.cost.toFixed(2), 4 + 0.2 + 20 + 5 + 8);
   assert.equal(+c.savedLow.toFixed(2), 0.2);
   assert.equal(+c.savedHigh.toFixed(2), 4);
+});
+
+console.log('helper sessions, terse caps, digest stubs and the baseline');
+await test('digest stubs: deterministic, keep head/errors/tail, and are hard-capped', () => {
+  const text = ['$ npm test', ...Array.from({ length: 500 }, (_, i) => `ok ${i} - suite ${i % 7}`),
+    'FAIL src/auth/session.test.ts > refreshes an expired token',
+    'AssertionError: expected 401 to be 200',
+    '    at Object.<anonymous> (src/auth/session.test.ts:42:11)',
+    ...Array.from({ length: 60 }, (_, i) => `  noise ${i}`),
+    'Tests: 1 failed, 412 passed, 413 total'].join('\n');
+  const block = { type: 'tool_result', tool_use_id: 't1', content: text };
+  const use = { name: 'Bash', input: { command: 'npm test' } };
+  const a = digestOf(block, use, text.length, 'stale');
+  const b = digestOf(block, use, text.length, 'stale');
+  assert.equal(a, b, 'byte-identical replay is what keeps the cache intact');
+  assert.ok(a.length <= 700, `digest is capped (was ${a.length})`);
+  assert.match(a, /^\[ccpager: paged out — Bash npm test, \d+ chars, stale/);
+  assert.match(a, /FAIL src\/auth\/session\.test\.ts/);
+  assert.match(a, /AssertionError: expected 401 to be 200/);
+  assert.match(a, /Tests: 1 failed, 412 passed/);
+  assert.match(a, /more line\(s\) elided/);
+  const small = { type: 'tool_result', tool_use_id: 't2', content: 'one\ntwo' };
+  assert.match(digestOf(small, use, 7, 'stale'), /first line: one/, 'small results keep the one-liner');
+});
+await test('a stub is frozen to the bytes first sent, even as the session continues', () => {
+  const s = newSession();
+  const first = pageRequest(agentic(30), smart, s, 0).body;
+  const stub = results(first)[0].content;
+  assert.match(stub, /^\[ccpager: paged out/);
+  assert.ok(stub.length > 200, 'a 5000-char result gets a digest, not one line');
+  const later = pageRequest(agentic(38), smart, s, 2000).body;
+  assert.equal(results(later)[0].content, stub);
+});
+await test('classify: only subagent system prompts are helpers', () => {
+  assert.equal(classify({ system: "You are Claude Code, Anthropic's official CLI for Claude.", messages: [{ role: 'user', content: 'hi' }] }).kind, 'main');
+  assert.equal(classify({ system: [{ type: 'text', text: "You are an agent for Claude Code, Anthropic's official CLI." }] }).kind, 'helper');
+  assert.equal(classify({ system: 'You are a file search specialist for Claude Code.' }).marker, 'file-search specialist');
+  assert.equal(classify({ messages: [{ role: 'user', content: 'You are an agent for Claude Code' }] }).kind, 'main', 'user text is never a classification signal');
+});
+await test('helper routing: downgrades a marked session once, sticks, leaves main and small models alone', () => {
+  const cfg = { paging: false, cacheTtl: 'off', routing: false, protect: true, protectAt: 80, protectModel: 'claude-sonnet-5-5',
+    helperRouting: true, helperModel: 'claude-haiku-5-5', terseHelper: false, helperMaxTokens: 8000, helperThinkTokens: 4000 };
+  const helperBody = { model: 'claude-opus-5-5', system: 'You are a file search specialist for Claude Code.', messages: [{ role: 'user', content: 'find the auth code' }] };
+  const s = newSession(); s.kind = 'helper';   // the gateway classifies the session when it first sees it
+  const r = transform(helperBody, cfg, s, { active: false });
+  assert.equal(r.body.model, 'claude-haiku-5-5');
+  assert.equal(r.report.routed.why, 'helper');
+  s.lastAt = 1;
+  const later = { ...helperBody, messages: [...helperBody.messages, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'more' }] };
+  assert.equal(transform(later, cfg, s, { active: false }).body.model, 'claude-haiku-5-5', 'sticky for the session');
+  const main = { model: 'claude-opus-5-5', system: 'You are Claude Code.', messages: [{ role: 'user', content: 'hello' }] };
+  assert.equal(transform(main, cfg, newSession(), { active: false }).body.model, 'claude-opus-5-5');
+  assert.equal(transform({ ...helperBody, model: 'claude-sonnet-5-5' }, cfg, newSession(), { active: false }).body.model, 'claude-sonnet-5-5');
+  assert.equal(transform(helperBody, { ...cfg, helperRouting: false }, newSession(), { active: false }).body.model, 'claude-opus-5-5');
+});
+await test('terse: one cached system block, identical next time, caps output and thinking', () => {
+  const cfg = { terseHelper: true, helperMaxTokens: 8000, helperThinkTokens: 4000 };
+  const body = { model: 'claude-opus-5-5', max_tokens: 32000, thinking: { type: 'enabled', budget_tokens: 12000 },
+    system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h' } }], messages: [] };
+  const s = { kind: 'helper' };
+  const a = applyTerse(body, cfg, s);
+  assert.equal(a.max_tokens, 8000);
+  assert.equal(a.thinking.budget_tokens, 4000);
+  assert.equal(a.system.length, 2);
+  assert.equal(a.system[0].cache_control, undefined, 'the breakpoint moves onto the terse block');
+  assert.ok(a.system[1].cache_control, 'so the terse text is cached too');
+  assert.match(a.system[1].text, /Output style: terse/);
+  assert.equal(applyTerse(a, cfg, s), a, 'idempotent: the same bytes on every request');
+  assert.equal(body.system[0].cache_control.ttl, '1h', 'the cached block itself is never edited');
+  assert.equal(applyTerse({ ...body, system: 'sys' }, cfg, { kind: 'main' }).max_tokens, 32000);
+  assert.equal(applyTerse(body, { ...cfg, terseHelper: false }, s).max_tokens, 32000);
+});
+await test('session keys survive <env> churn and tell different agent toolsets apart', () => {
+  const S = new Sessions();
+  const mk = (env, tool) => ({ system: 'sys', tools: [{ name: tool }], metadata: { user_id: 'u1' },
+    messages: [{ role: 'user', content: `<env>${env}</env>\nfix the bug ${'x'.repeat(300)}` }] });
+  assert.equal(S.key(mk('cwd=/a', 'Read')), S.key(mk('cwd=/b platform=linux', 'Read')),
+    'a changing environment block must not start a new session');
+  assert.notEqual(S.key(mk('cwd=/a', 'Read')), S.key(mk('cwd=/a', 'Grep')), 'a different toolset is a different agent');
+});
+await test('stats keep the on and off sides apart, with output and rounds, so a baseline is comparable', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccpager-stats-'));
+  const st = new Stats(dir);
+  const u = { input_tokens: 10, cache_read_input_tokens: 100, cache_creation_input_tokens: 20, output_tokens: 5 };
+  st.record({ pagedBlocks: 1, charsSaved: 40, rounds: 1 });
+  st.usage(u, { model: 'claude-opus-5-5', rounds: 1 });
+  st.record({ pagedBlocks: 0, charsSaved: 0, rounds: 0, off: true });
+  st.usage(u, { model: 'claude-opus-5-5', off: true, rounds: 0 });
+  st.flush();
+  const d = JSON.parse(fs.readFileSync(path.join(dir, 'stats.json'), 'utf8'));
+  const day = d.byDay[new Date().toISOString().slice(0, 10)];
+  assert.equal(day.onRequests, 1); assert.equal(day.offRequests, 1);
+  assert.equal(day.onPromptTokens, 130); assert.equal(day.offPromptTokens, 130);
+  assert.equal(day.onOutput, 5); assert.equal(day.offOutput, 5);
+  assert.equal(day.onRounds, 1); assert.equal(day.offRounds, 0);
 });
 
 console.log('cli');

@@ -21,7 +21,16 @@ export const config = {
   // the newest message only, so the cache prefix is never disturbed.
   fresh: bool(process.env.CCPAGER_FRESH, true),
   rereadDiff: bool(process.env.CCPAGER_REREAD_DIFF, true),
-  keepRecentTurns: num(process.env.CCPAGER_KEEP_TURNS, 6),   // recent steps (tool rounds) kept verbatim
+  // A single tool result larger than this keeps its head and tail and elides the middle (0 = off),
+  // and a long grep/rg hit list becomes the first few matches per file plus a count of the rest.
+  // Both are decided once, when the result is newest, then replayed byte-for-byte.
+  freshBudget: num(process.env.CCPAGER_FRESH_BUDGET, 24000),
+  freshMatches: bool(process.env.CCPAGER_FRESH_MATCHES, true),
+  // Recent steps (tool rounds) kept verbatim. 4, not 6: with digest stubs the paged results keep
+  // their head, error lines and tail, so test/bench.js (which now prices the re-runs paging can
+  // cause) shows 4 ahead of 6 at every re-run rate it sweeps. `ccpager set keepTurns 6` if your
+  // sessions are mostly long, linear investigations.
+  keepRecentTurns: num(process.env.CCPAGER_KEEP_TURNS, 4),
   pageStep: num(process.env.CCPAGER_PAGE_STEP, 8),            // cutoff can move at most every N steps
   minPageChars: num(process.env.CCPAGER_MIN_CHARS, 1200),     // don't bother stubbing small outputs
   // Above this many prompt tokens, move the cutoff even on a warm cache to delay auto-compaction.
@@ -46,6 +55,17 @@ export const config = {
   protect: bool(process.env.CCPAGER_PROTECT, true),
   protectModel: process.env.CCPAGER_PROTECT_MODEL || 'claude-sonnet-5-5',
   protectAt: num(process.env.CCPAGER_PROTECT_AT, 80),
+
+  // Helper/subagent sessions: a session whose system prompt marks it as a Claude Code subagent
+  // starts on `helperModel` and stays there (decided once, at session start, when nothing is
+  // cached yet), and its output is asked to be terse with capped output and thinking budgets.
+  // The model tier is the large saving; the terse part is cheap and safe but small — see the
+  // sweep at the end of `test/bench.js` rather than trusting the idea.
+  helperRouting: bool(process.env.CCPAGER_HELPER_ROUTING, true),
+  helperModel: process.env.CCPAGER_HELPER_MODEL || 'claude-sonnet-5-5',
+  terseHelper: bool(process.env.CCPAGER_TERSE, true),
+  helperMaxTokens: num(process.env.CCPAGER_HELPER_MAX_TOKENS, 8000),
+  helperThinkTokens: num(process.env.CCPAGER_HELPER_THINK, 4000),
 
   // Look for a newer release on GitHub at most once a day and say so in `ccpager status` and
   // the window. One small GET; nothing else is sent. `ccpager off updates` disables it.

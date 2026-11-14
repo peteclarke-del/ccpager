@@ -11,8 +11,15 @@
 //    full becomes "identical to the read at message N" when nothing changed, or a unified diff
 //    against that read when the diff is much smaller than the file. The earlier read is then
 //    pinned so paging cannot remove the base out from under the diff.
+//  * matches: a grep/rg hit list becomes the first few matches per file plus "+N more in file",
+//    which is the same information a reader takes from it.
+//  * budget: a single result larger than `budget` characters keeps its head and tail and elides
+//    the middle with an explicit marker, so the model knows what is missing and how to get it.
 //
-// Error results and results that are already ccpager stubs are left alone.
+// The last two are lossy, which is why they run only on the newest result (where they cost one
+// comparison) and why every marker says what was removed. They attack the *incremental* part of a
+// request — new tool output, written to the cache at 25–40x a cache read — which is where the tokens
+// actually are. Error results and results that are already ccpager stubs are left alone.
 const STUB_PREFIX = '[ccpager:';
 const MIN_CHARS = 400;            // smaller results aren't worth touching
 const MIN_SAVING = 0.10;          // tidy must save at least this share...
@@ -21,6 +28,44 @@ const DIFF_MAX_SHARE = 0.6;       // a diff bigger than this share of the file i
 const MAX_DIFF_LINES = 6000;      // beyond this the line diff is too slow; send the file
 
 const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[=>]/g;
+
+// Budget and match-summary tuning. Both are conservative: they only fire on results that are
+// clearly mechanical, and they say exactly what they removed.
+export const DEFAULT_BUDGET = 24000;   // chars; 0 = off
+const BUDGET_HEAD = 120, BUDGET_TAIL = 200;
+const BUDGET_MIN_LINES = 300;          // short results are never elided
+const MATCH_LINE = /^([^\s:][^:]*):(\d+)(?::\d+)?:/;   // path:line: or path:line:col:
+const MATCH_MIN_LINES = 40, MATCH_MIN_FILES = 8, MATCH_PER_FILE = 3;
+
+// Lines that look like program output rather than source: timestamps, log levels, test tallies,
+// stack frames, grep hits, commit hashes. A source file is mostly none of these, which is what
+// keeps the budget away from it.
+const OUTPUT_LINE = new RegExp([
+  '^\\s*\\[?\\d{4}-\\d{2}-\\d{2}', '^\\s*[A-Z][a-z]{2} \\d+ \\d{2}:\\d{2}:\\d{2}',
+  '\\d{2}:\\d{2}:\\d{2}',
+  '^\\s*(?:INFO|DEBUG|WARN(?:ING)?|ERROR|TRACE|FATAL)\\b',
+  '^\\s*(?:ok|PASS(?:ED)?|FAIL(?:ED)?|SKIP|Tests?:|Ran \\d+)',
+  '^\\s*[\u2713\u2714\u2717\u2716\u00d7]',
+  '^\\s*at\\s+\\S+.*:\\d+',
+  '^\\S+:\\d+(?::\\d+)?:',
+  '^[0-9a-f]{7,40}\\s',
+].join('|'));
+
+// A Read result is a file the model asked to see. It is never elided, whatever it contains.
+const SOURCE_TOOLS = new Set(['Read', 'NotebookRead']);
+
+/** True when most non-blank lines look like program output (a log, a test run, a hit list). */
+export function looksMechanical(text) {
+  let total = 0, output = 0;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    total++;
+    if (OUTPUT_LINE.test(line)) output++;
+  }
+  return total > 0 && output / total >= 0.6;
+}
+
+
 
 /** Text of a tool_result block, or null when it is not plain text (images etc.). */
 function textOf(block) {
@@ -58,6 +103,56 @@ export function tidy(text) {
     try { const mini = JSON.stringify(JSON.parse(trimmed)); if (mini.length < trimmed.length * 0.8) t = mini; } catch {}
   }
   return t;
+}
+
+/**
+ * Head and tail of an oversized result, with an explicit marker where the middle was. Returns null
+ * when the text is already under budget, is short enough to read as it is, or eliding would not save
+ * most of it. Deterministic: the same input always produces the same bytes.
+ */
+export function budgetText(text, maxChars = DEFAULT_BUDGET, { mechanical = false } = {}) {
+  if (!maxChars || text.length <= maxChars) return null;
+  const lines = text.split('\n');
+  if (lines.length < BUDGET_MIN_LINES) return null;
+  // Code is not mechanical output: a 700-line file must not lose its middle to a budget meant for
+  // logs and hit lists. Callers that know the result is output can skip the check.
+  if (!mechanical && !looksMechanical(text)) return null;
+  const head = lines.slice(0, BUDGET_HEAD);
+  const tail = lines.slice(-BUDGET_TAIL);
+  const elided = lines.length - head.length - tail.length;
+  if (elided < lines.length * 0.5) return null;            // most of it would stay: not worth a marker
+  const kept = head.join('\n').length + tail.join('\n').length;
+  if (kept > text.length * 0.75) return null;
+  return [...head,
+    `… [ccpager: ${elided} of ${lines.length} lines elided; re-run with a narrower range (offset/limit, head, sed -n) if you need the middle]`,
+    ...tail].join('\n');
+}
+
+/**
+ * A grep/rg hit list as the first few matches per file plus a count of the rest. Files keep the order
+ * they first appear in, so the output is deterministic. Returns null unless the list is long enough
+ * and spread over enough files to be worth rewriting.
+ */
+export function summarizeMatches(text) {
+  const counts = new Map(), kept = new Map();
+  let matched = 0;
+  for (const line of text.split('\n')) {
+    const m = MATCH_LINE.exec(line);
+    if (!m) continue;
+    matched++;
+    const file = m[1];
+    counts.set(file, (counts.get(file) || 0) + 1);
+    const list = kept.get(file) || [];
+    if (list.length < MATCH_PER_FILE) { list.push(line.trim().slice(0, 200)); kept.set(file, list); }
+  }
+  if (matched < MATCH_MIN_LINES || counts.size < MATCH_MIN_FILES) return null;
+  const out = [`[ccpager: ${matched} matches in ${counts.size} files; first ${MATCH_PER_FILE} per file]`];
+  for (const [file, list] of kept) {
+    out.push(...list);
+    const rest = counts.get(file) - list.length;
+    if (rest > 0) out.push(`  +${rest} more in ${file}`);
+  }
+  return out.join('\n');
 }
 
 /** Minimal unified diff (no headers) between two texts, by line. Returns null when too large. */
@@ -115,8 +210,8 @@ export function lineDiff(a, b) {
  * `session.fresh` maps tool_use_id -> { text, base } decided earlier. Returns
  * { out, freshBlocks, charsSaved, decided } where `decided` lists ids decided on this request.
  */
-export function compressFresh(messages, session, { enabled = true, rereadDiff = true } = {}) {
-  const stats = { out: messages, freshBlocks: 0, charsSaved: 0, decided: [] };
+export function compressFresh(messages, session, { enabled = true, rereadDiff = true, budget = DEFAULT_BUDGET, matches = true } = {}) {
+  const stats = { out: messages, freshBlocks: 0, charsSaved: 0, decided: [], budgeted: 0, matched: 0 };
   if (!enabled || !Array.isArray(messages) || !messages.length) return stats;
   const fresh = session?.fresh || new Map();
   const uses = new Map();
@@ -157,9 +252,24 @@ export function compressFresh(messages, session, { enabled = true, rereadDiff = 
         }
       }
       if (!decided) {
-        const tidied = tidy(text);
-        const saved = text.length - tidied.length;
-        if (saved >= MIN_SAVED_CHARS && saved >= text.length * MIN_SAVING) decided = { text: tidied, base: null };
+        let cand = tidy(text);
+        let kind = 'tidy';
+        if (matches) {
+          const summary = summarizeMatches(cand);
+          if (summary && summary.length < cand.length) { cand = summary; kind = 'matches'; }
+        }
+        if (budget) {
+          // A Read result is never elided, and neither is a shell command that prints source code:
+          // mechanical means the text looks like output, not just that the tool was not Read.
+          const trimmed = budgetText(cand, budget, { mechanical: !SOURCE_TOOLS.has(u?.name) && looksMechanical(cand) });
+          if (trimmed && trimmed.length < cand.length) { cand = trimmed; kind = 'budget'; }
+        }
+        const saved = text.length - cand.length;
+        if (saved >= MIN_SAVED_CHARS && saved >= text.length * MIN_SAVING) {
+          decided = { text: cand, base: null, kind };
+          if (kind === 'matches') stats.matched++;
+          else if (kind === 'budget') stats.budgeted++;
+        }
       }
       if (decided) { fresh.set(b.tool_use_id, decided); stats.decided.push(b.tool_use_id); }
     }
@@ -182,11 +292,19 @@ export function compressFresh(messages, session, { enabled = true, rereadDiff = 
   return stats;
 }
 
+// How many diff bases may be pinned at once. Without a cap, a long session accumulates pins and
+// eventually nothing can be paged; with it, the most recent diffs keep their base and older ones are
+// allowed to be paged (the diff then refers to a stubbed message, which is the same trade paging
+// makes everywhere: the model can re-read).
+const MAX_PINS = 8;
+
 /** tool_use ids that must not be paged because a later diff refers to them. */
 export function pinnedBases(messages, session) {
   const pinned = new Set();
   if (!session?.fresh?.size) return pinned;
   const stubbed = session.stubbed || new Map();
-  for (const [id, f] of session.fresh) if (f.base && !stubbed.has(id)) pinned.add(f.base);
+  const live = [];
+  for (const [id, f] of session.fresh) if (f.base && !stubbed.has(id)) live.push(f.base);
+  for (const id of live.slice(-MAX_PINS)) pinned.add(id);   // Map keeps insertion order: newest last
   return pinned;
 }
