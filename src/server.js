@@ -35,6 +35,7 @@ export function transform(body, config, session = null, protect = { active: fals
     const f = compressFresh(body.messages, session, { rereadDiff: config.rereadDiff, budget: config.freshBudget, matches: config.freshMatches });
     if (f.freshBlocks) body = { ...body, messages: f.out };
     report.freshBlocks = f.freshBlocks; report.freshChars = f.charsSaved; report.charsSaved += f.charsSaved;
+    report.freshWriteChars = f.writeChars;   // only results elided on this request avoided a cache write
   }
   const t = extendCacheTtl(body, config.cacheTtl);
   body = t.body; report.upgraded = t.upgraded;
@@ -176,7 +177,7 @@ export function createServer(config, log = console) {
 
       const tap = report && !isCount && upstream.ok
         ? usageTap(stats, (upstream.headers.get('content-type') || '').includes('event-stream'),
-          { model: report.model, charsSaved: report.charsSaved, assume1h: report.assume1h, rewriteChars: report.rewriteChars || 0, session,
+          { model: report.model, charsSaved: report.charsSaved, writeChars: report.freshWriteChars || 0, assume1h: report.assume1h, rewriteChars: report.rewriteChars || 0, session,
             off: !!report.off, rounds: report.rounds || 0 })
         : null;
       const stream = Readable.fromWeb(upstream.body);

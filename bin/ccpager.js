@@ -141,8 +141,10 @@ ${models.length ? `\n  by model\n${models.map(([m, b]) => `    ${m.padEnd(22)} $
 
   Money is API-equivalent value at list prices. On a Pro/Max plan you don't pay it, but
   it is the best guide to your usage limit: cache reads count almost nothing against the
-  limit, cache writes count like fresh input. "Value saved" prices removed tokens as
-  cache reads (what they'd mostly have been). "Cache rewrites" is the extra cost of
+  limit, cache writes count like fresh input. "Value saved" prices each kind for what it
+  avoided: paged history, and a trimmed result replayed on a later request, as a cache
+  read; a result elided on this request as the cache write it prevented, which is 25x
+  (5-minute TTL) to 40x (1-hour TTL) a read at Opus prices. "Cache rewrites" is the extra cost of
   moving the cutoff while the cache was warm; smart mode only does that when it pays.
   "If uncached" is the ceiling when the cache would have expired anyway. "Extra work in
   limit" is net value as a share of what the requests cost: how many more requests fit.

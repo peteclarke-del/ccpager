@@ -678,6 +678,28 @@ await test('cost uses the 1h write rate when the API reports it, and values savi
   assert.equal(+c.savedLow.toFixed(2), 0.2);
   assert.equal(+c.savedHigh.toFixed(2), 4);
 });
+await test('savings are priced for what they avoided: a first elision at the write rate, everything else at the read rate', () => {
+  const u = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 4_000_000,
+    cache_creation: { ephemeral_5m_input_tokens: 4_000_000, ephemeral_1h_input_tokens: 0 } };
+  const tok = 25_000;
+  const paged = costOf('claude-opus-5-5', u, tok);                        // old history: a cache read
+  const wrote = costOf('claude-opus-5-5', u, tok, { writeTokens: tok });   // elided this turn: a cache write
+  const replay = costOf('claude-opus-5-5', u, tok, { writeTokens: 0 });    // same stub next turn: a read again
+  assert.equal(+paged.savedLow.toFixed(4), 0.005);
+  assert.equal(+wrote.savedLow.toFixed(4), 0.125);
+  assert.equal(replay.savedLow, paged.savedLow, 'a replayed trim is worth a cache read, not the write again');
+  assert.equal(Math.round(wrote.savedLow / paged.savedLow), 25, 'a write token is worth 25 read tokens on a 5m cache');
+  const u1h = { ...u, cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 4_000_000 } };
+  assert.equal(+costOf('claude-opus-5-5', u1h, tok, { writeTokens: tok }).savedLow.toFixed(3), 0.2, '40x on a 1h cache');
+  const mixed = costOf('claude-opus-5-5', u, 25_000, { writeTokens: 15_000 });
+  assert.equal(+mixed.savedLow.toFixed(4), 0.077, '10k read-rate + 15k write-rate');
+  assert.equal(+mixed.savedHigh.toFixed(4), 0.115);
+  for (const c of [paged, wrote, mixed]) assert.ok(c.savedHigh >= c.savedLow, 'the "if uncached" ceiling is a real upper bound');
+  // No cache write at all (TTL off, or a prompt too short to cache): the removed token was input.
+  const noCache = { input_tokens: 100_000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  assert.equal(+costOf('claude-opus-5-5', noCache, tok, { writeTokens: tok }).savedLow.toFixed(4), 0.1,
+    'priced as the fresh input it would have been, not as a write that never happened');
+});
 
 console.log('helper sessions, terse caps, digest stubs and the baseline');
 await test('digest stubs: deterministic, keep head/errors/tail, and are hard-capped', () => {
@@ -772,6 +794,32 @@ await test('stats keep the on and off sides apart, with output and rounds, so a 
   assert.equal(day.onPromptTokens, 130); assert.equal(day.offPromptTokens, 130);
   assert.equal(day.onOutput, 5); assert.equal(day.offOutput, 5);
   assert.equal(day.onRounds, 1); assert.equal(day.offRounds, 0);
+});
+await test('a fresh-trimmed request books write-rate money in the buckets, a paged one the read rate', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccpager-stats-'));
+  const st = new Stats(dir);
+  const u = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 400_000 };
+  st.usage(u, { model: 'claude-opus-5-5', charsSaved: 100_000, writeChars: 100_000 });  // first elision: a write
+  st.usage(u, { model: 'claude-opus-5-5', charsSaved: 100_000 });                        // replayed stub: a read
+  st.usage(u, { model: 'claude-opus-5-5', charsSaved: 100_000 });                        // paged history: a read
+  const day = st.data.byDay[new Date().toISOString().slice(0, 10)];
+  assert.equal(+day.savedLow.toFixed(4), 0.135, '$0.125 write + $0.005 replayed read + $0.005 paged read');
+  assert.ok(day.savedLow < 0.2, 'the replayed stub was not booked as a second cache write');
+  assert.ok(day.savedHigh >= day.savedLow, 'ceiling still above value saved once the three are mixed');
+});
+await test('a fresh trim books as a cache write once, then as a cache read while it is replayed', () => {
+  const hits = Array.from({ length: 300 }, (_, i) => `src/feature${i % 9}.ts:${i + 1}:export const value${i} = ${i};`).join('\n');
+  const messages = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Grep', input: { pattern: 'value', path: 'src' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: hits }] },
+  ];
+  const s = { fresh: new Map() };
+  const first = compressFresh(messages, s, {});
+  assert.ok(first.charsSaved > 0, 'the hit list was summarised');
+  assert.equal(first.writeChars, first.charsSaved, 'on the request that elides it, the saving is a cache write');
+  const again = compressFresh(messages, s, {});      // the same messages again, decision reused
+  assert.equal(again.charsSaved, first.charsSaved, 'the same characters stay out of the prompt');
+  assert.equal(again.writeChars, 0, 'but nothing new was elided, so no write is avoided a second time');
 });
 
 console.log('cli');
