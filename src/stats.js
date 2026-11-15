@@ -50,7 +50,7 @@ export class Stats {
     this.dirty = true;
   }
   /** Called once a response finishes, with its usage block and what ccpager removed from that request. */
-  usage(u, { model = '', charsSaved = 0, assume1h = false, rewriteChars = 0, off = false, rounds = 0 } = {}) {
+  usage(u, { model = '', charsSaved = 0, writeChars = 0, assume1h = false, rewriteChars = 0, off = false, rounds = 0 } = {}) {
     if (!u) return;
     const d = this.data.usage;
     d.input += u.input_tokens || 0;
@@ -59,8 +59,11 @@ export class Stats {
     d.cacheWrite += u.cache_creation_input_tokens || 0;
 
     const tokensSaved = Math.round(charsSaved / CHARS_PER_TOKEN);
+    // Only the result elided on this very request avoided a cache write; the stubs replayed on
+    // later requests avoid reads, like paged history, and costOf prices them apart.
+    const writeTokens = Math.round(writeChars / CHARS_PER_TOKEN);
     const promptTokens = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
-    const c = costOf(model, u, tokensSaved, { assume1h, rewriteTokens: Math.round(rewriteChars / CHARS_PER_TOKEN) });
+    const c = costOf(model, u, tokensSaved, { assume1h, rewriteTokens: Math.round(rewriteChars / CHARS_PER_TOKEN), writeTokens });
     d.cacheWrite1h += c.w1h; d.cacheWrite5m += c.w5m;
     const add = (b) => {
       b.requests++; b.tokensSaved += tokensSaved; b.promptTokens += promptTokens;
