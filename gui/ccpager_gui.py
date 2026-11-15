@@ -293,13 +293,13 @@ class Window(Adw.ApplicationWindow):
         # (key, title, tooltip). Rows starting with "sep" are section captions.
         metrics = [
             ("sep:Tokens", None, None),
-            ("tokens", "Tokens kept out", "Tokens removed from prompts, counted every time they would have been resent. ~4 characters per token."),
-            ("reduced", "Prompt reduced by", "Share of all prompt tokens that paging removed."),
+            ("tokens", "Tokens kept out", "Tokens removed from prompts, counted once for fresh tool output and again for every request that would have resent old history. ~4 characters per token."),
+            ("reduced", "Prompt reduced by", "Share of all prompt tokens that paging and the fresh-output trims removed."),
             ("sep:Money", None, None),
-            ("gross", "Value of tokens kept out", "Priced as cache reads, which is what the removed history would mostly have been. Deliberately conservative."),
+            ("gross", "Value of tokens kept out", "Priced for what each kind of token would have been: paged history, and a fresh trim replaying on a later request, as a cache read; a tool result elided on this very request as the cache write it prevented (25–40× a read at Opus prices)."),
             ("rewrite", "Cost of cache rewrites", "Extra cost of moving the cutoff while the cache was warm: the prompt after the change is written to the cache again at 25–40× the read price."),
             ("value", "Net value saved", "Value of tokens kept out minus cache rewrites. Positive means ccpager is paying for itself; negative means it moved the cutoff too often."),
-            ("ceiling", "If uncached, up to", "Ceiling: what the same tokens would have cost as fresh input, reached when the cache had expired anyway."),
+            ("ceiling", "If uncached, up to", "A real ceiling: paged history as fresh input, reached when the cache had expired anyway, and freshly trimmed output as the cache write it would have needed regardless."),
             ("sep:Limit", None, None),
             ("headroom", "Extra work within your limit", "Net value saved as a share of what the requests actually cost. +5% means about 5% more requests fit before a usage limit."),
             ("time", "Extra time per 5-hour window", "At the pace of your current 5-hour session window, how much longer you can work before reaching the same point. Estimated from the headroom and the window's pace; appears once a pace is known."),
@@ -626,7 +626,7 @@ class Window(Adw.ApplicationWindow):
             ("routing", "Model routing", "Send short, simple instructions to a smaller model. Off by default: switching models starts that turn's cache cold"),
             ("protect", "Protect the usage limit", "When a usage window would run out before it resets (or passes the threshold below), start new sessions such as subagents on the protect model and route light turns to the small model, until the pace is safe. Conversations already under way are never switched"),
             ("helper", "Helper subagents on a cheaper model", "A session whose system prompt marks it as a Claude Code subagent (Explore, a file-search specialist, a helper) starts on the helper model below and stays there, so its cache is never invalidated by a switch. Decided once, at session start. Your main conversation is never moved"),
-            ("terse", "Terse output for helper subagents", "Ask subagent sessions to answer in the fewest tokens, and cap their output and thinking budgets below. Output is the most expensive token (5× input, ~100× a cache read at Opus prices), so this is the largest saving available"),
+            ("terse", "Terse output for helper subagents", "Ask subagent sessions to answer in the fewest tokens, and cap their output and thinking budgets below. Output is expensive per token (5× input, ~100× a cache read at Opus prices), but an agent loop writes little prose next to the prompt it keeps re-reading: the benchmark prices this at about 1% of total cost. Putting subagents on the cheaper model is the large saving; this one is cheap and safe"),
             ("updates", "Check for updates", "Looks at ccpager's GitHub releases page once a day and shows a notice on Overview when a newer version exists. Nothing else is sent"),
         ]:
             sw = Gtk.Switch()

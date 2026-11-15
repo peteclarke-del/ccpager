@@ -208,10 +208,13 @@ export function lineDiff(a, b) {
 /**
  * Decide and apply fresh-result rewrites. `messages` is the (already paged) message list;
  * `session.fresh` maps tool_use_id -> { text, base } decided earlier. Returns
- * { out, freshBlocks, charsSaved, decided } where `decided` lists ids decided on this request.
+ * { out, freshBlocks, charsSaved, writeChars, decided } where `decided` lists ids decided on this
+ * request, and `writeChars` is the part of `charsSaved` those newly elided results account for —
+ * the only characters whose cache *write* was avoided. A stub replayed on a later request keeps
+ * the same characters out of the prompt but avoids a cache read instead, so it is booked apart.
  */
 export function compressFresh(messages, session, { enabled = true, rereadDiff = true, budget = DEFAULT_BUDGET, matches = true } = {}) {
-  const stats = { out: messages, freshBlocks: 0, charsSaved: 0, decided: [], budgeted: 0, matched: 0 };
+  const stats = { out: messages, freshBlocks: 0, charsSaved: 0, writeChars: 0, decided: [], budgeted: 0, matched: 0 };
   if (!enabled || !Array.isArray(messages) || !messages.length) return stats;
   const fresh = session?.fresh || new Map();
   const uses = new Map();
@@ -275,6 +278,7 @@ export function compressFresh(messages, session, { enabled = true, rereadDiff = 
     }
   }
   if (!fresh.size) return stats;
+  const decidedNow = new Set(stats.decided);
   stats.out = messages.map((m) => {
     if (m.role !== 'user' || !Array.isArray(m.content)) return m;
     let changed = false;
@@ -283,7 +287,9 @@ export function compressFresh(messages, session, { enabled = true, rereadDiff = 
       const text = textOf(b);
       if (text == null || text.startsWith(STUB_PREFIX)) return b; // paged already; the stub wins
       const f = fresh.get(b.tool_use_id);
-      stats.freshBlocks++; stats.charsSaved += Math.max(0, text.length - f.text.length);
+      const saved = Math.max(0, text.length - f.text.length);
+      stats.freshBlocks++; stats.charsSaved += saved;
+      if (decidedNow.has(b.tool_use_id)) stats.writeChars += saved;
       changed = true;
       return { ...b, content: f.text };
     });
