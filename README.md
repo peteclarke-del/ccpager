@@ -43,9 +43,9 @@ The window needs GTK 4 + libadwaita for Python, already present on most GNOME de
 | ![Overview](docs/overview.png) | ![Setup](docs/setup.png) |
 | ![Settings](docs/settings.png) | ![Logs](docs/logs.png) |
 
-- **Overview**: gateway status, the master on/off switch, where ccpager is in use, **plan usage** (5-hour session window and weekly cap as gauges, with time elapsed, reset time, current pace and the predicted run-out time, updating as you work), and a Savings card in three sections: tokens kept out, money (value of tokens kept out, cost of cache rewrites, the net, and the uncached ceiling) and limit (extra work that fits within your limit, and the extra time that buys per 5-hour window at your current pace), each for today, 7 days and all time. A red warning appears if Claude Code is pointed at ccpager while the gateway is down, with a one-click fix.
+- **Overview**: gateway status, the master on/off switch, where ccpager is in use, **plan usage** (5-hour session window and weekly cap as gauges, with time elapsed, reset time, current pace and the predicted run-out time, updating as you work), and a Savings card in three sections: tokens kept out, money (value of tokens kept out — priced for what each kind of saving avoided — cost of cache rewrites, the net, and the uncached ceiling) and limit (extra work that fits within your limit, and the extra time that buys per 5-hour window at your current pace), each for today, 7 days and all time. A red warning appears if Claude Code is pointed at ccpager while the gateway is down, with a one-click fix.
 - **Setup**: run at login, route **all Claude Code apps** (VS Code, JetBrains, desktop app, CLI) or only **specific project folders**, add/remove the app-menu launcher, and remove everything.
-- **Settings**: paging, 1-hour cache, model routing and limit-protection switches; the small model; tuning (steps kept, paging step, minimum size, large-context threshold, protection threshold); local port. Changes save immediately and apply to the next request; a port change restarts the gateway and updates Claude Code's settings for you. The protect model is set from the terminal (`ccpager set protectModel ...`).
+- **Settings**: paging, 1-hour cache, model routing, limit protection, helper-subagent routing and terse output; the small and helper models; tuning (steps kept, paging step, minimum size, fresh budget, large-context threshold, protection threshold, helper output and thinking caps); local port. Changes save immediately and apply to the next request; a port change restarts the gateway and updates Claude Code's settings for you. The protect model is set from the terminal (`ccpager set protectModel ...`).
 - **Logs**: one line per request, following live.
 
 The window runs the same `ccpager` commands you can type, so the window and the terminal always agree. Everything is saved in `~/.ccpager/state.json`.
@@ -124,7 +124,7 @@ No restart, no VS Code reload. The change applies to the next request:
 ```bash
 ccpager off            # pure pass-through: requests forwarded byte-for-byte unchanged
 ccpager on             # back on
-ccpager off routing    # or toggle one feature: paging | fresh | cache | routing | protect | updates
+ccpager off routing    # or toggle one feature: paging | fresh | cache | routing | protect | helper | terse | updates
 ccpager on routing
 ```
 
@@ -182,6 +182,21 @@ $ ccpager stats
 - **API cost of the rest** is what the requests that actually ran would cost in API credits, using the real usage numbers Anthropic returns, including 1-hour cache writes. A line shows what share of cache writes used the 1-hour and 5-minute tiers, which is how you confirm which TTL you're actually getting.
 - On a Pro/Max plan you don't pay these amounts, but they are the best available guide to your usage limit. Anthropic says cached tokens count less than uncached ones against plan limits, and community measurements put a cache read at roughly 1/60th of a fresh token while cache writes count like fresh input. So **net value saved**, not the raw % of prompt tokens removed, is what tracks your limit: removing tokens that would have been cache reads saves almost nothing, and a cache rewrite costs real limit.
 
+Once both sides have 20 requests, `ccpager stats` also prints a with/without comparison from your own traffic — an observation, not a controlled test:
+
+```
+  with vs without ccpager   (your own traffic, on and off: observational, not a controlled test)
+                                  with        without
+    requests                       412            388
+    prompt tokens / request       18.2k          24.9k
+    output tokens / request        612            640
+    tool rounds / request          9.40          9.10
+    API cost / request            $0.041        $0.062
+  work per token: 1.51× (same mix assumed; run `ccpager off` and on for comparable periods)
+```
+
+What it cannot show: the two sides differ by request mix, not just by ccpager (a subagent-heavy stretch looks nothing like a long main conversation, and turning ccpager off also turns off helper routing). Treat the multiplier as a check on direction; the benchmark above is where the sizing comes from.
+
 Prices are in `src/pricing.js` (from the Claude pricing page, Oct 2026); update them there if they change.
 
 ## When paging pays off
@@ -208,14 +223,16 @@ Benchmark (simulated: a 200-step Opus 5.5 session with varied tool-output sizes,
 
 So expect a modest saving that grows with breaks and resumed sessions, and almost no auto-compactions. That table is from 0.5, when paging used one-line stubs. Since 0.7 the stub is a digest and `keepTurns` defaults to 4, because `test/bench.js` now prices the re-runs that paging can cause: at 4 it is ahead of 6 in every scenario, and ahead of 6 at every re-run rate the sweep tries (0%, 15%, 40%). `ccpager set keepTurns 6` if your sessions are mostly long, linear investigations. The script is `test/bench.js`; its re-run rates are an assumption, and it says so.
 
+The current code, same script, three seeds: a long warm session costs **$12.08 against $19.54** with ccpager off — **1.62×** the work per dollar. It is 1.55× on a 5-minute cache, 1.49× with a 70-minute break every 40 steps, 1.90× over a 60-step session, and 2.04× (2.55× when 70% of sessions are subagents) once helper sessions share the traffic. Paging alone is 1.06–1.09×, so the fresh trims are the lever, and the model tier is what lifts the helper mixes. Every figure survives the sweeps: fresh trims still beat paging-only if every trim cost a full re-run, and the terse directive is priced at a swept 0/10/25/50% output cut, where 25% is worth about 1% of total cost.
+
 ## Fresh results
 
 Paging only acts on history, so every tool output is sent in full at least once and written to the cache at full size. The fresh-result stage shrinks it before that first send, with two rules that keep every piece of information a reader could use:
 
 - **tidy**: strip ANSI colour, keep only the final state of lines redrawn with carriage returns (progress bars), drop trailing whitespace, collapse runs of blank lines, fold runs of identical lines into `line   [× N]`, and minify a result that is one large pretty-printed JSON document. Applied only when it saves at least 10% and 200 characters, so ordinary file reads are untouched.
 - **re-read**: when a tool reads the same file as an earlier result still in context, an unchanged file becomes a one-line reference to that message and a slightly changed one becomes a unified diff against it (used only when the diff is under 60% of the file). The earlier read is then pinned so paging cannot stub it out from under the diff; at most the 8 most recent pins are kept, so a long session still pages.
-- **budget**: a single result bigger than `freshBudget` characters (24k by default) keeps its first 120 and last 200 lines and elides the middle with a marker that says how to get it back (offset/limit, `head`, `sed -n`) — aimed at 60k-character test logs, `find` dumps and service logs. It only fires on output that looks mechanical: at least half its non-blank lines are timestamps, log levels, test tallies, stack frames, hit-list entries or commit hashes. A `Read` result is never elided, and neither is `cat src/file.ts`, because source code does not look like that.
-- **matches**: a grep/rg hit list becomes the first 3 matches per file plus `+N more in file`, which is the same thing a reader takes from it. Both are lossy, so they run only on the newest result and say exactly what was removed.
+- **budget**: a single result bigger than `freshBudget` characters (24k by default) keeps its first 120 and last 200 lines and elides the middle with a marker that says how to get it back (offset/limit, `head`, `sed -n`) — aimed at 60k-character test logs, `find` dumps and service logs. It only fires on output that looks mechanical: at least 60% of its non-blank lines are timestamps, log levels, test tallies, stack frames, hit-list entries or commit hashes. A `Read` result is never elided, and neither is `cat src/file.ts`, because source code does not look like that.
+- **matches**: a grep/rg hit list of 40+ lines across 8+ files becomes the first 3 matches per file plus `+N more in file`, which is the same thing a reader takes from it. Both are lossy, so they run only on the newest result and say exactly what was removed.
 
 The decision is made once, on the newest message only, and remembered per session; on every later request the same bytes are sent, so this never invalidates the prompt cache. Error results and results already paged are left alone. `ccpager stats` reports fresh results tidied. Turn it off with `ccpager off fresh`; `CCPAGER_REREAD_DIFF=false` keeps tidy but not diffs.
 
@@ -226,7 +243,7 @@ ccpager hook install     # adds a PreToolUse hook for Bash to ~/.claude/settings
 ccpager hook remove
 ```
 
-The hook rewrites a known list of noisy commands into quieter forms with the same information: `git status` → `git status --short --branch`, `git log` → `--oneline -n 30`, `npm install` without the funding and audit banners, `npm test`/`pytest`/`jest` with quiet flags and the last 60–80 lines, `cargo`/`make`/`docker build` quiet, `curl`/`wget` silent, `ls -la` capped at 100 lines, and so on. Only a bare simple command is rewritten: anything with a pipe, `&&`, redirection, `$(...)` or a heredoc was written on purpose and runs as typed. The hook never sets a permission decision, so your normal prompts still apply to the rewritten command. Applies to new Claude Code sessions.
+The hook rewrites a known list of noisy commands into quieter forms with the same information: `git status` → `git status --short --branch`, `git log` → `--oneline -n 30`, `npm install` without the funding and audit banners, `npm test`/`pytest`/`jest` with quiet flags and the last 60–80 lines (`pytest` also gets `--tb=short` when you haven't chosen a traceback style yourself), `rg`/`grep`/`git grep` capped at 200 matches, `find` at 200 lines, `docker logs`/`journalctl` at 200 lines, `cargo`/`make`/`docker build` quiet, `curl`/`wget` silent, `ls -la` capped at 100 lines, and so on. Only a bare simple command is rewritten: anything with a pipe, `&&`, redirection, `$(...)` or a heredoc was written on purpose and runs as typed. The hook never sets a permission decision, so your normal prompts still apply to the rewritten command. Applies to new Claude Code sessions.
 
 ## Cache TTL
 
@@ -294,4 +311,4 @@ A release is a tag `vX.Y.Z` whose version matches `package.json` and the newest 
 
 ## Tests
 
-`npm test` runs unit tests for paging, TTL and routing, plan-limit parsing, run-out prediction and adaptive protection, plus end-to-end tests of the gateway against a mock Anthropic server (streaming, auth passthrough, usage and limit-header tracking, connection retry, protection kicking in). `node test/bench.js` runs the cost benchmark above.
+`npm test` runs unit tests for paging and digest stubs, fresh trims (tidy, re-read diffs, the mechanical budget, match summaries), savings pricing (a first elision at the write rate, a replayed stub at the read rate, the ceiling above both), the helper/terse routing decision, session keying, TTL, model routing, plan-limit parsing, run-out prediction, the on/off stats buckets and adaptive protection, plus end-to-end tests of the gateway against a mock Anthropic server (streaming, auth passthrough, usage and limit-header tracking, connection retry, protection kicking in). `node test/bench.js` runs the cost benchmark above.
