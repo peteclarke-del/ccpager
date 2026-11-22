@@ -31,6 +31,8 @@ export const config = {
   // cause) shows 4 ahead of 6 at every re-run rate it sweeps. `ccpager set keepTurns 6` if your
   // sessions are mostly long, linear investigations.
   keepRecentTurns: num(process.env.CCPAGER_KEEP_TURNS, 4),
+  // Also stub the big string inputs of old Write/Edit calls (the file on disk already has them).
+  pageInputs: bool(process.env.CCPAGER_PAGE_INPUTS, true),
   pageStep: num(process.env.CCPAGER_PAGE_STEP, 8),            // cutoff can move at most every N steps
   minPageChars: num(process.env.CCPAGER_MIN_CHARS, 1200),     // don't bother stubbing small outputs
   // Above this many prompt tokens, move the cutoff even on a warm cache to delay auto-compaction.

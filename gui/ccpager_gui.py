@@ -622,6 +622,7 @@ class Window(Adw.ApplicationWindow):
         for name, title, sub in [
             ("paging", "Context paging", "Replace old, bulky tool output (file reads, test logs) with short stubs"),
             ("fresh", "Tidy fresh tool output", "Strip colour codes, progress bars, repeated lines and pretty-printing from new tool results, and send a re-read of a file as a diff against the earlier read. Decided once per result, so the cache is never disturbed"),
+            ("inputs", "Page old file-write inputs", "Replace the large content of old Write/Edit calls with a one-line stub. The file on disk already holds it, so resending it every turn is wasted tokens. Decided at the same cutoff as tool results"),
             ("cache", "Force the 1-hour cache window", "Off by default: Claude Code already asks for the 1-hour cache where it pays (your main conversation on a subscription) and uses 5 minutes for subagents, where an hour costs double to write. Turn on only with an API key, or set promptCacheTtl in Claude Code instead"),
             ("routing", "Model routing", "Send short, simple instructions to a smaller model. Off by default: switching models starts that turn's cache cold"),
             ("protect", "Protect the usage limit", "When a usage window would run out before it resets (or passes the threshold below), start new sessions such as subagents on the protect model and route light turns to the small model, until the pace is safe. Conversations already under way are never switched"),
@@ -811,7 +812,7 @@ class Window(Adw.ApplicationWindow):
 
             m = s["mode"]
             self.master.set_active(m["enabled"])
-            on = [n for n in ("paging", "fresh", "cache", "routing", "protect", "helper", "terse") if m.get(n)]
+            on = [n for n in ("paging", "fresh", "inputs", "cache", "routing", "protect", "helper", "terse") if m.get(n)]
             if m.get("protect") and s.get("protect", {}).get("active"):
                 on = [n for n in on if n != "protect"] + [f"protect ACTIVE ({s['protect']['reason']})"]
             self.master_row.set_subtitle(("On: " + ", ".join(on) if on else "On, but every feature is switched off")

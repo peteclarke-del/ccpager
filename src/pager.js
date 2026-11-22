@@ -3,8 +3,9 @@
 // Design rules:
 //  * Age is measured in *steps* (assistant messages, i.e. tool rounds), not typed
 //    prompts: one prompt in Claude Code can run dozens of tool rounds.
-//  * Only tool_result blocks inside user messages are touched. Assistant messages
-//    (incl. thinking blocks and their signatures) and tool_use ids are never modified.
+//  * Tool_result blocks inside user messages are paged, and so are the big string inputs of old
+//    Write/Edit tool_use blocks. Thinking blocks and their signatures, text, and tool_use ids
+//    and names are never modified.
 //  * Cache-aware. Moving the cutoff changes old content, so Anthropic must rewrite the
 //    prompt cache from that point on, and a cache write costs ~25-40x a cache read.
 //    In "smart" mode the cutoff only moves when that's free or clearly pays off:
@@ -129,6 +130,51 @@ function candidates(messages, cutoff, opts) {
   return { found, uses };
 }
 
+// Large inputs of old file-writing calls (Write content, Edit old/new strings). Once the call has
+// run, the file on disk holds the content, so the copy in history is dead weight resent every turn.
+// Decided at the same cutoff move as the results and frozen, so the cache prefix stays stable.
+const INPUT_FIELDS = { Write: ['content'], Edit: ['old_string', 'new_string'], MultiEdit: ['edits'], NotebookEdit: ['new_source'] };
+const fieldSize = (v) => (typeof v === 'string' ? v.length : v == null ? 0 : JSON.stringify(v).length);
+
+function inputCandidates(messages, cutoff, opts, known) {
+  const found = new Map(); // tool_use id -> { index, size, text: { field: stub } }
+  for (let i = 0; i < cutoff; i++) {
+    const m = messages[i];
+    if (m.role !== 'assistant' || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      const fields = b.type === 'tool_use' && INPUT_FIELDS[b.name];
+      if (!fields || known.has(b.id) || !b.input) continue;
+      const text = {}; let size = 0;
+      for (const f of fields) {
+        const n = fieldSize(b.input[f]);
+        if (n < opts.minPageChars || (typeof b.input[f] === 'string' && b.input[f].startsWith(STUB_PREFIX))) continue;
+        text[f] = `${STUB_PREFIX} ${f} of ${b.name}${b.input.file_path ? ' ' + b.input.file_path : ''}, ${n} chars; the call ran, re-read the file if you need it]`;
+        size += n - text[f].length;
+      }
+      if (size > 0) found.set(b.id, { index: i, size, text });
+    }
+  }
+  return found;
+}
+
+function applyInputStubs(messages, inputs) {
+  let blocks = 0, chars = 0;
+  const out = messages.map((m) => {
+    if (m.role !== 'assistant' || !Array.isArray(m.content)) return m;
+    let changed = false;
+    const content = m.content.map((b) => {
+      const v = b.type === 'tool_use' && inputs.get(b.id);
+      if (!v) return b;
+      const input = { ...b.input };
+      for (const [f, t] of Object.entries(v.text)) { chars += Math.max(0, fieldSize(input[f]) - t.length); input[f] = t; }
+      blocks++; changed = true;
+      return { ...b, input };
+    });
+    return changed ? { ...m, content } : m;
+  });
+  return { out, blocks, chars };
+}
+
 function applyStubs(messages, stubbed, uses) {
   let pagedBlocks = 0, charsSaved = 0;
   const out = messages.map((m) => {
@@ -184,10 +230,12 @@ export function pageRequest(body, opts, session = null, now = Date.now()) {
   const { found, uses } = candidates(messages, target > 0 ? steps[target] : 0, opts);
   for (const id of opts.pinned || []) found.delete(id);   // bases of fresh-result diffs stay in full
   const fresh = [...found].filter(([id]) => !s.stubbed.has(id));
+  s.inputs ||= new Map();
+  const freshIn = opts.pageInputs === false ? [] : [...inputCandidates(messages, target > 0 ? steps[target] : 0, opts, s.inputs)];
 
-  if (canMove && fresh.length) {
-    const freshChars = fresh.reduce((n, [, f]) => n + f.size, 0);
-    const firstIdx = Math.min(...fresh.map(([, f]) => f.index));
+  if (canMove && (fresh.length || freshIn.length)) {
+    const freshChars = fresh.reduce((n, [, f]) => n + f.size, 0) + freshIn.reduce((n, [, f]) => n + f.size, 0);
+    const firstIdx = Math.min(...fresh.map(([, f]) => f.index), ...freshIn.map(([, f]) => f.index));
     const tail = JSON.stringify(messages.slice(firstIdx)).length - freshChars;
     const ttlMs = (ttl === '1h' ? 55 : 4.5) * 60_000;
     const cold = s.lastAt == null || now - s.lastAt > ttlMs;
@@ -208,6 +256,7 @@ export function pageRequest(body, opts, session = null, now = Date.now()) {
       for (const [id, f] of found) {
         if (!s.stubbed.has(id)) s.stubbed.set(id, { reason: f.reason, text: digestOf(f.block, uses.get(id), f.size, f.reason) });
       }
+      for (const [id, f] of freshIn) s.inputs.set(id, f);
       s.boundary = target;
       stats.moved = true; stats.reason = reason;
       if (!cold) stats.rewriteChars = tail;
@@ -218,10 +267,11 @@ export function pageRequest(body, opts, session = null, now = Date.now()) {
   }
 
   s.lastAt = now;
-  const { out, pagedBlocks, charsSaved } = applyStubs(messages, s.stubbed, uses);
-  stats.pagedBlocks = pagedBlocks; stats.charsSaved = charsSaved;
-  if (!pagedBlocks) return { body, stats };
-  return { body: { ...body, messages: out }, stats };
+  const r = applyStubs(messages, s.stubbed, uses);
+  const inp = applyInputStubs(r.out, s.inputs);
+  stats.pagedBlocks = r.pagedBlocks + inp.blocks; stats.charsSaved = r.charsSaved + inp.chars;
+  if (!stats.pagedBlocks) return { body, stats };
+  return { body: { ...body, messages: inp.out }, stats };
 }
 
 /**

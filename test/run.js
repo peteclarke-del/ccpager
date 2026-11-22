@@ -15,6 +15,7 @@ import { createServer } from '../src/server.js';
 import { createLogger } from '../src/log.js';
 import { writeState } from '../src/state.js';
 import { costOf, priceFor } from '../src/pricing.js';
+import { effectiveConfig } from '../src/state.js';
 import { classify } from '../src/session-type.js';
 import { applyTerse } from '../src/terse.js';
 import { Stats } from '../src/stats.js';
@@ -55,6 +56,34 @@ function agentic(steps, { reread = null, chars = 5000 } = {}) {
 }
 const results = (b) => b.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).filter((x) => x.type === 'tool_result');
 const newSession = () => ({ stubbed: new Map(), boundary: 0, lastAt: null });
+
+await test('old Write/Edit inputs are paged at the cutoff, frozen, and signatures untouched', () => {
+  const b = agentic(40);
+  b.messages[1].content[1] = { type: 'tool_use', id: 'tu0', name: 'Write', input: { file_path: 'a.ts', content: 'y'.repeat(9000) } };
+  const recent = b.messages[b.messages.length - 2].content[1];
+  recent.name = 'Write'; recent.input = { file_path: 'z.ts', content: 'q'.repeat(9000) };
+  const sess = newSession();
+  const r = pageRequest(b, smart, sess, 0).body;
+  const w = r.messages[1].content[1];
+  assert.ok(w.input.content.startsWith('[ccpager: paged out'), 'old Write content stubbed');
+  assert.equal(w.input.file_path, 'a.ts');
+  assert.equal(r.messages[1].content[0].signature, 's0');
+  assert.equal(r.messages[r.messages.length - 2].content[1].input.content.length, 9000, 'recent kept');
+  const again = pageRequest(b, smart, sess, 1000).body;                 // held: same bytes replayed
+  assert.equal(JSON.stringify(again.messages[1]), JSON.stringify(r.messages[1]));
+});
+
+await test('hookInstalled recognises the installed absolute-path command', () => {
+  const f = path.join(os.tmpdir(), `ccp-hook-${process.pid}.json`);
+  fs.writeFileSync(f, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: '"/n/node" "/x/bin/ccpager.js" hook run' }] }] } }));
+  assert.equal(hookInstalled(f), true);
+  fs.unlinkSync(f);
+});
+
+await test('inputs switch: `off inputs` disables input paging via effectiveConfig', () => {
+  assert.equal(effectiveConfig({ pageInputs: true }, { inputs: false }).pageInputs, false);
+  assert.equal(effectiveConfig({ pageInputs: true }, {}).pageInputs, true);
+});
 
 await test('counts tool steps, not typed prompts: one prompt + 40 tool rounds gets paged', () => {
   const { body, stats } = pageRequest(agentic(40), smart);
@@ -665,6 +694,9 @@ console.log('pricing & savings');
 await test('per-model prices, Haiku long-context tier, unknown model falls back', () => {
   assert.equal(priceFor('claude-opus-5-5-20261001').input, 4);
   assert.equal(priceFor('claude-sonnet-5').read, 0.2);
+  assert.equal(priceFor('claude-fable-5-2').input, 8);
+  assert.equal(priceFor('claude-fable-5-2').read, 0.2);
+  assert.equal(priceFor('claude-mythos-5-2').output, 40);
   assert.equal(priceFor('claude-sonnet-5-5').read, 0.1);
   assert.equal(priceFor('claude-haiku-5-5', 50_000).input, 0.1);
   assert.equal(priceFor('claude-haiku-5-5', 150_000).input, 0.5);
@@ -827,11 +859,11 @@ await test('on/off/status/stats commands', () => {
   const env = { ...process.env, HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'home-')), CCPAGER_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'ccp-')), CCPAGER_PORT: '18765' };
   const cli = (...a) => execFileSync(process.execPath, ['bin/ccpager.js', ...a], { env, encoding: 'utf8' });
   assert.match(cli('off'), /OFF: requests now pass through unchanged/);
-  assert.match(cli('on', 'routing'), /ON  paging on · fresh on · cache off · routing on · protect on · updates on/); // 1h upgrade is off by default
+  assert.match(cli('on', 'routing'), /ON  paging on · fresh on · inputs on · cache off · routing on · protect on · updates on/); // 1h upgrade is off by default
   assert.match(cli('on', 'cache'), /cache 1h/);
   assert.match(cli('off', 'cache'), /cache off/);
   assert.throws(() => execFileSync(process.execPath, ['bin/ccpager.js', 'off', 'bogus'], { env, encoding: 'utf8', stdio: 'pipe' }));
-  assert.match(cli('status'), /mode      ON  paging on · fresh on · cache off · routing on · protect on · updates on/);
+  assert.match(cli('status'), /mode      ON  paging on · fresh on · inputs on · cache off · routing on · protect on · updates on/);
   assert.match(cli('status'), /protect   armed/);
   assert.match(cli('off', 'protect'), /protect off/);
   assert.match(cli('status'), /usage     not seen yet/);

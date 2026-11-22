@@ -198,7 +198,7 @@ async function statusObject() {
       global: { file: GLOBAL_SETTINGS, pointed: pointedAt(GLOBAL_SETTINGS) === mine },
       projects: projects().map((dir) => ({ dir, file: targetFile(dir), pointed: pointedAt(targetFile(dir)) === mine })),
     },
-    mode: { enabled: eff.enabled, paging: eff.paging, fresh: eff.fresh, cache: eff.cacheTtl !== 'off', routing: eff.routing,
+    mode: { enabled: eff.enabled, paging: eff.paging, fresh: eff.fresh, inputs: eff.pageInputs, cache: eff.cacheTtl !== 'off', routing: eff.routing,
       protect: eff.protect, helper: eff.helperRouting, terse: eff.terseHelper, updates: eff.updateCheck },
     protect: h?.protect || { active: false, reason: null },
     settings: Object.fromEntries(Object.entries(TUNABLES).map(([n, s]) => [n, eff[s.key]])),
@@ -223,7 +223,7 @@ async function ensureRunning() {
 }
 
 const modeLine = (eff) => (eff.enabled
-  ? `ON  paging ${eff.paging ? 'on' : 'off'} · fresh ${eff.fresh ? 'on' : 'off'} · cache ${eff.cacheTtl === 'off' ? 'off' : eff.cacheTtl} · routing ${eff.routing ? 'on' : 'off'} · protect ${eff.protect ? 'on' : 'off'} · updates ${eff.updateCheck ? 'on' : 'off'} · helper ${eff.helperRouting ? 'on' : 'off'} · terse ${eff.terseHelper ? 'on' : 'off'}`
+  ? `ON  paging ${eff.paging ? 'on' : 'off'} · fresh ${eff.fresh ? 'on' : 'off'} · inputs ${eff.pageInputs ? 'on' : 'off'} · cache ${eff.cacheTtl === 'off' ? 'off' : eff.cacheTtl} · routing ${eff.routing ? 'on' : 'off'} · protect ${eff.protect ? 'on' : 'off'} · updates ${eff.updateCheck ? 'on' : 'off'} · helper ${eff.helperRouting ? 'on' : 'off'} · terse ${eff.terseHelper ? 'on' : 'off'}`
   : 'OFF: pass-through, requests forwarded unchanged');
 
 // ---------- commands ----------
@@ -530,7 +530,7 @@ StartupWMClass=io.github.ccpager
   ccpager disable [--project DIR]  send it straight to Anthropic again
   ccpager status           what's running, where it's routed, what's switched on   (--json)
   ccpager logs             recent requests, then follow live
-  ccpager off [feature]    switch optimizations off instantly (all, or paging | fresh | cache | routing | protect | helper | terse | updates)
+  ccpager off [feature]    switch optimizations off instantly (all, or paging | fresh | inputs | cache | routing | protect | helper | terse | updates)
   ccpager hook install     trim noisy Bash output at the source (git, npm, pytest…) via a Claude Code hook  (--remove)
   ccpager on [feature]     switch back on
   ccpager set NAME VALUE   change a setting (saved; applies live). \`ccpager get\` lists them
