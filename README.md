@@ -22,7 +22,7 @@ A local, open-source take on what Vachi AI does: a gateway that sits between Cla
 **Debian / Ubuntu package** (recommended): download `ccpager_<version>_all.deb` from the [latest release](https://github.com/peteclarke-del/ccpager/releases/latest) and install it:
 
 ```bash
-sudo apt install ./ccpager_0.8.1_all.deb
+sudo apt install ./ccpager_0.8.2_all.deb
 ```
 
 That installs the `ccpager` command, adds **ccpager** to your app menu and pulls in Node.js and the GTK libraries. It works on any architecture.
