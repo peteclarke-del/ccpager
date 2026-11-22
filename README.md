@@ -9,6 +9,7 @@ A local, open-source take on what Vachi AI does: a gateway that sits between Cla
 | Fresh tool output tidied (cache-safe) | On by default. New tool results lose colour codes, progress bars, trailing space, blank-line and repeated-line runs, and pretty-printing of JSON; a re-read of a file that is still in context is sent as "identical to message N" or as a unified diff against it. Decided once, when the result is newest, then replayed byte-for-byte so the cache prefix is never disturbed (see "Fresh results"). |
 | Bash output trimmed at the source | Opt-in `ccpager hook install`: a Claude Code hook rewrites noisy commands (`git status`, `npm test`, `pytest`, `cargo build`…) to their quiet forms before they run, so the output is small in every request that carries it. Pipelines and anything with redirection are left exactly as typed, and your permission prompts are unchanged. |
 | Context paging (stale context removed) | Old tool results (file reads, test output, grep dumps) older than the last 4 tool steps are replaced with a compact digest — the head, the lines that look like errors or stack frames, and the tail, capped at 700 characters — but only when that's cheaper than leaving them (see below). A digest exists so the model does not have to re-run a tool to learn what the stub took away; a re-run is far more expensive than the stub. Reads of a file that was read again later are paged as superseded. |
+| Old file-write inputs paged | On by default. The big `content` / `old_string` / `new_string` of an old `Write` or `Edit` is replaced with a one-line stub at the same frozen cutoff as tool results, because the file on disk already holds it. `ccpager off inputs` disables it. |
 | Extended caching windows | Opt-in. Upgrades every `cache_control: ephemeral` breakpoint to `ttl: "1h"`. Off by default because Claude Code now requests the 1-hour cache itself where it pays (see "Cache TTL"). |
 | Turn-level model routing (Vachi: "coming soon") | Opt-in. Short, clearly light instructions ("rename this variable") go to Haiku; anything mid-task or heavy stays on your model. Only applies on a cold cache, since a switch mid-conversation would rewrite it. |
 | Subagents on a cheaper model, and terser | On by default. A session whose system prompt marks it as a Claude Code subagent (Explore, a file-search specialist, a helper) starts on `claude-sonnet-5-5` and stays there for its life, so its cache is never invalidated by a switch, and its output is asked to be terse with capped output and thinking budgets. Decided once, at session start; your main conversation is never moved. The model tier is what moves work-per-token by a factor — `test/bench.js` measures the terse part on its own at around 1% of total cost at 500 output tokens per request, because an agent loop writes little prose next to the prompt it re-reads. |
@@ -124,7 +125,7 @@ No restart, no VS Code reload. The change applies to the next request:
 ```bash
 ccpager off            # pure pass-through: requests forwarded byte-for-byte unchanged
 ccpager on             # back on
-ccpager off routing    # or toggle one feature: paging | fresh | cache | routing | protect | helper | terse | updates
+ccpager off routing    # or toggle one feature: paging | fresh | inputs | cache | routing | protect | helper | terse | updates
 ccpager on routing
 ```
 
@@ -251,7 +252,7 @@ Claude Code decides the cache TTL itself: on a Claude subscription within plan u
 
 ## How paging stays safe
 
-- Only `tool_result` blocks inside user messages are rewritten. Assistant turns, thinking blocks and their signatures, and `tool_use` ids are never touched, so the API accepts the request.
+- Only `tool_result` blocks and the large string inputs of old `Write`/`Edit`/`MultiEdit`/`NotebookEdit` calls (their `content`, `old_string`, `new_string`; the file on disk already holds it) are rewritten, at the same frozen cutoff as results. Assistant text, thinking blocks and their signatures, and `tool_use` ids and names are never touched, so the API accepts the request.
 - Decisions are frozen per session: a block stays stubbed once stubbed, and nothing older changes between cutoff moves (each Claude Code session and subagent is tracked separately).
 - Stubs tell the model what was removed and to re-run the tool if it needs it ("Read src/auth/session.ts, 9812 chars, stale").
 - Error results are kept. If a request body can't be parsed, it's forwarded unchanged (fail open).
@@ -272,6 +273,7 @@ ccpager enable --project ~/code/billing-api    # just one project
 | `CCPAGER_REREAD_DIFF` | `true` | the re-read part of the above |
 | `CCPAGER_FRESH_BUDGET` | 24000 | a single *mechanical* tool result (a log, a test run, a hit list) larger than this keeps its head and tail and elides the middle with a marker. A `Read` result is never elided, and a shell command that prints source code is left alone (0 = off) |
 | `CCPAGER_FRESH_MATCHES` | `true` | a long grep/rg hit list becomes the first few matches per file plus a count of the rest |
+| `CCPAGER_PAGE_INPUTS` | `true` | stub the large inputs of old `Write`/`Edit` calls at the cutoff (`ccpager off inputs`) |
 | `CCPAGER_KEEP_TURNS` | 4 | recent tool steps sent verbatim |
 | `CCPAGER_PAGE_STEP` | 8 | minimum steps between cutoff moves |
 | `CCPAGER_PAGING_MODE` | `smart` | `always` pages at every step boundary regardless of cache cost |

@@ -81,7 +81,8 @@ export function handleHook(input) {
 }
 
 const SETTINGS = () => path.join(process.env.CCPAGER_HOME || os.homedir(), '.claude', 'settings.json');
-const MARK = 'ccpager hook run';
+// Matches both `ccpager hook run` and the installed form `"…/bin/ccpager.js" hook run`.
+const MARK = /ccpager(\.js)?"?\s+hook run/;
 
 function readSettings(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; } }
 
@@ -90,7 +91,7 @@ export function installHook({ remove = false, command = 'ccpager hook run', file
   const s = readSettings(file);
   s.hooks ||= {};
   const list = Array.isArray(s.hooks.PreToolUse) ? s.hooks.PreToolUse : [];
-  const kept = list.filter((e) => !(e.hooks || []).some((h) => String(h.command || '').includes(MARK)));
+  const kept = list.filter((e) => !(e.hooks || []).some((h) => MARK.test(String(h.command || ''))));
   if (!remove) kept.push({ matcher: 'Bash', hooks: [{ type: 'command', command, timeout: 5 }] });
   if (kept.length) s.hooks.PreToolUse = kept; else delete s.hooks.PreToolUse;
   if (!Object.keys(s.hooks).length) delete s.hooks;
@@ -101,5 +102,5 @@ export function installHook({ remove = false, command = 'ccpager hook run', file
 
 export function hookInstalled(file = SETTINGS()) {
   const s = readSettings(file);
-  return (s.hooks?.PreToolUse || []).some((e) => (e.hooks || []).some((h) => String(h.command || '').includes(MARK)));
+  return (s.hooks?.PreToolUse || []).some((e) => (e.hooks || []).some((h) => MARK.test(String(h.command || ''))));
 }

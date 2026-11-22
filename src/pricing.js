@@ -3,6 +3,8 @@
 // what the same work would cost in API credits.
 const TABLE = [
   // prefix,             input, write5m, write1h, read,  output
+  ['claude-fable-5-2',   8,     10,      16,      0.20,  40],
+  ['claude-mythos-5-2',  8,     10,      16,      0.20,  40],
   ['claude-fable-5-1',   10,    12.5,    20,      0.25,  50],
   ['claude-mythos-5-1',  10,    12.5,    20,      0.25,  50],
   ['claude-fable-5',     10,    12.5,    20,      1,     50],

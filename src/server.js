@@ -149,6 +149,10 @@ export function createServer(config, log = console) {
           log.log(`${req.url.split('?')[0]} model=${out.body.model} msgs=${turns} paged=${report.pagedBlocks}${report.freshBlocks ? ` fresh=${report.freshBlocks}` : ''} saved=~${Math.round(report.charsSaved / 4)}tok ttl+=${report.upgraded}${report.routed ? ` routed→${report.routed.to} (${report.routed.why})` : ''}${why}`);
         } catch (e) {
           log.warn('transform skipped, forwarded unchanged:', e.message); // fail open
+          // Still count the request and its usage, so the panels don't miss traffic that failed open.
+          let model = ''; try { model = JSON.parse(raw.toString('utf8')).model; } catch {}
+          report = { pagedBlocks: 0, charsSaved: 0, upgraded: 0, routed: null, model };
+          if (!isCount) stats.record(report);
         }
       }
 

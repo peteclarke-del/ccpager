@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const FEATURES = { paging: 'paging', fresh: 'fresh', cache: 'cacheTtl', routing: 'routing', protect: 'protect', helper: 'helperRouting', terse: 'terseHelper', updates: 'updateCheck' };
+export const FEATURES = { paging: 'paging', fresh: 'fresh', inputs: 'pageInputs', cache: 'cacheTtl', routing: 'routing', protect: 'protect', helper: 'helperRouting', terse: 'terseHelper', updates: 'updateCheck' };
 
 export const statePath = (dataDir) => path.join(dataDir, 'state.json');
 
@@ -63,6 +63,7 @@ export function effectiveConfig(config, state) {
   const c = { ...config, enabled: state.enabled !== false };
   if (typeof state.paging === 'boolean') c.paging = state.paging;
   if (typeof state.fresh === 'boolean') c.fresh = state.fresh;
+  if (typeof state.inputs === 'boolean') c.pageInputs = state.inputs;
   if (typeof state.routing === 'boolean') c.routing = state.routing;
   if (typeof state.protect === 'boolean') c.protect = state.protect;
   if (typeof state.helper === 'boolean') c.helperRouting = state.helper;
